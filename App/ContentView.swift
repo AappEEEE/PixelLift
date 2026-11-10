@@ -45,6 +45,7 @@ struct ContentView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 4)
                     }
+                    buildStamp
                 }
                 .padding()
                 .padding(.bottom, 24)
@@ -423,6 +424,19 @@ struct ContentView: View {
         case .failure(let error):
             engine.notice = "导入失败：\(error.localizedDescription)"
         }
+    }
+
+    // MARK: - 版本戳
+
+    private var buildStamp: some View {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info["CFBundleVersion"] as? String ?? "?"
+        return Text("v\(version) (build \(build)) · 批量 + 文件导入版")
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 4)
     }
 
     // MARK: - 说明

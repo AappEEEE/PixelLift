@@ -62,21 +62,26 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            CODE_SIGN_ENTITLEMENTS=""
+            CODE_SIGN_ENTITLEMENTS="" \
+            MARKETING_VERSION="0.1.${{ github.run_number }}" \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}"
 
       - name: Package unsigned IPA
         run: |
           ls -la build/PixelLift.xcarchive/Products/Applications/
           mkdir -p Payload
           cp -R build/PixelLift.xcarchive/Products/Applications/PixelLift.app Payload/
-          zip -qry PixelLift-unsigned.ipa Payload
-          ls -lh PixelLift-unsigned.ipa
+          IPA="PixelLift-v0.1.${{ github.run_number }}-unsigned.ipa"
+          zip -qry "$IPA" Payload
+          ls -lh "$IPA"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/PixelLift.app/Info.plist
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Payload/PixelLift.app/Info.plist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: PixelLift-unsigned-ipa
-          path: PixelLift-unsigned.ipa
+          path: PixelLift-v*-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
 
@@ -86,7 +91,7 @@ jobs:
           tag_name: v0.1.${{ github.run_number }}
           name: PixelLift v0.1.${{ github.run_number }} · 图片 AI 超分
           make_latest: true
-          files: PixelLift-unsigned.ipa
+          files: PixelLift-v*-unsigned.ipa
           fail_on_unmatched_files: true
           body: |
             **PixelLift** 是 iOS 上的本地视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
