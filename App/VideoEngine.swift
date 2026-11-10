@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreImage
 import CoreML
+import CryptoKit
 import Foundation
 import Photos
 import UIKit
@@ -570,6 +571,8 @@ enum VideoRenderer {
                        settings: VideoSettings,
                        box: ModelBox,
                        control: RunControl,
+                       timeRange: CMTimeRange? = nil,
+                       baseFrames: Int = 0,
                        onFrame: @escaping @Sendable (Int, Int) -> Void,
                        onNotice: @escaping @Sendable (String) -> Void) throws -> Report {
         let asset = AVURLAsset(url: source)
@@ -589,6 +592,9 @@ enum VideoRenderer {
             reader = try AVAssetReader(asset: asset)
         } catch {
             throw VideoRenderError.readerSetup
+        }
+        if let timeRange {
+            reader.timeRange = timeRange
         }
 
         let videoOut = AVAssetReaderVideoCompositionOutput(
@@ -738,7 +744,7 @@ enum VideoRenderer {
                 throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "帧写入失败")
             }
             outIndex += 1
-            onFrame(outIndex, totalOut)
+            onFrame(baseFrames + outIndex, totalOut)
         }
 
         func emit(_ a: [UInt8], _ b: [UInt8], t: Float,
@@ -864,8 +870,115 @@ enum VideoRenderer {
             throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "封装失败")
         }
 
-        onFrame(max(outIndex, 1), max(outIndex, 1))
+        onFrame(max(baseFrames + outIndex, 1), max(outIndex, 1))
         return Report(frames: outIndex, outputURL: dest)
+    }
+
+    // MARK: 分片渲染 + 拼接（M5）
+
+    /// 每片覆盖的源时间长度（秒）。20 秒在「中断损失」和「拼接开销」之间比较平衡。
+    static let segmentSeconds: Double = 20
+
+    static func segmentCount(duration: Double) -> Int {
+        guard duration > 0 else { return 1 }
+        return max(1, Int(ceil(duration / segmentSeconds)))
+    }
+
+    static func framesPerSegment(outFps: Double) -> Int {
+        max(1, Int((segmentSeconds * outFps).rounded()))
+    }
+
+    /// 分片渲染：每片单独编码成 mp4，已完成的片直接跳过，最后用 composition 拼接。
+    static func renderSegmented(source: URL,
+                                dest: URL,
+                                settings: VideoSettings,
+                                box: ModelBox,
+                                control: RunControl,
+                                sessionDir: URL,
+                                doneSegments: Set<Int>,
+                                totalSegments: Int,
+                                onFrame: @escaping @Sendable (Int, Int) -> Void,
+                                onSegment: @escaping @Sendable (Int, Int) -> Void,
+                                onNotice: @escaping @Sendable (String) -> Void) throws -> Report {
+        try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
+        var urls: [URL] = []
+        let fpsPerSegment = framesPerSegment(outFps: settings.outFps)
+
+        for seg in 0..<totalSegments {
+            let url = sessionDir.appendingPathComponent(String(format: "seg-%04d.mp4", seg))
+            urls.append(url)
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            if doneSegments.contains(seg), exists { continue }
+
+            let start = CMTime(seconds: Double(seg) * segmentSeconds, preferredTimescale: 600)
+            let duration = CMTime(seconds: segmentSeconds, preferredTimescale: 600)
+            _ = try render(source: source,
+                           dest: url,
+                           settings: settings,
+                           box: box,
+                           control: control,
+                           timeRange: CMTimeRange(start: start, duration: duration),
+                           baseFrames: seg * fpsPerSegment,
+                           onFrame: onFrame,
+                           onNotice: onNotice)
+            onSegment(seg, totalSegments)
+        }
+
+        if urls.count == 1, let only = urls.first {
+            try? FileManager.default.removeItem(at: dest)
+            try FileManager.default.copyItem(at: only, to: dest)
+        } else {
+            try stitch(urls, dest: dest)
+        }
+        return Report(frames: settings.expectedFrames, outputURL: dest)
+    }
+
+    /// 用 AVMutableComposition 把分片按顺序接起来。passthrough 不重编码，
+    /// 所以必须是同一编码参数的分片；HEVC 8-bit 与 HEVC Main10 各自内部一致即可。
+    static func stitch(_ urls: [URL], dest: URL) throws {
+        let comp = AVMutableComposition()
+        guard let vTrack = comp.addMutableTrack(withMediaType: .video,
+                                                preferredTrackID: kCMPersistentTrackID_Invalid) else {
+            throw VideoRenderError.writerSetup
+        }
+        let aTrack = comp.addMutableTrack(withMediaType: .audio,
+                                          preferredTrackID: kCMPersistentTrackID_Invalid)
+        var cursor = CMTime.zero
+        var appended = 0
+
+        for url in urls {
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
+            guard let v = asset.tracks(withMediaType: .video).first else { continue }
+            let range = CMTimeRange(start: .zero, duration: v.timeRange.duration)
+            do {
+                try vTrack.insertTimeRange(range, of: v, at: cursor)
+            } catch {
+                throw VideoRenderError.writeFailed("第 \(appended + 1) 片拼接失败：\(error.localizedDescription)")
+            }
+            if let a = asset.tracks(withMediaType: .audio).first, let aTrack {
+                try? aTrack.insertTimeRange(CMTimeRange(start: .zero, duration: a.timeRange.duration),
+                                            of: a, at: cursor)
+            }
+            cursor = CMTimeAdd(cursor, range.duration)
+            appended += 1
+        }
+        guard appended > 0 else { throw VideoRenderError.writeFailed("没有可拼接的分片") }
+
+        try? FileManager.default.removeItem(at: dest)
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else {
+            throw VideoRenderError.writerSetup
+        }
+        export.outputURL = dest
+        export.outputFileType = .mp4
+        export.shouldOptimizeForNetworkUse = false
+        export.timeRange = CMTimeRange(start: .zero, duration: cursor)
+        let sem = DispatchSemaphore(value: 0)
+        export.exportAsynchronously { sem.signal() }
+        sem.wait()
+        guard export.status == .completed else {
+            throw VideoRenderError.writeFailed(export.error?.localizedDescription ?? "分片拼接失败")
+        }
     }
 
     /// 解码来的一帧 → 目标尺寸的 RGBx 缓冲（AI 模式下中间先做一次 4× 重建）
@@ -1106,6 +1219,15 @@ final class VideoEngine: ObservableObject {
     // MARK: 运行
 
     func start() {
+        run(resuming: false)
+    }
+
+    /// 继续上次没做完的分片任务（App 重启后也能接着跑）。
+    func resumePendingJob() {
+        run(resuming: true)
+    }
+
+    func run(resuming: Bool) {
         guard let clip, !isRunning else { return }
         let p = plan(for: clip)
         let settings = VideoSettings(targetWidth: p.width,
@@ -1138,33 +1260,79 @@ final class VideoEngine: ObservableObject {
         let source = clip.url
         let totalOut = p.frames
 
+        // HDR 走单条输出：分片拼接走 passthrough，10-bit HLG 的元数据在拼接时容易丢，
+        // 宁可不提供续传也不让画质退化。SDR 才分片。
+        let segments = hdrEnabled ? 1 : VideoRenderer.segmentCount(duration: clip.duration)
+        let jobKey = JobStore.key(source: source, settings: settings)
+        let sessionDir = JobStore.dir(for: jobKey)
+        var done: Set<Int> = []
+        if resuming, segments > 1 {
+            done = JobStore.load(key: jobKey)?.done ?? []
+        } else if segments > 1 {
+            try? FileManager.default.removeItem(at: sessionDir)
+        }
+        if segments > 1 {
+            JobStore.save(JobRecord(key: jobKey,
+                                    sourcePath: source.path,
+                                    width: settings.targetWidth,
+                                    height: settings.targetHeight,
+                                    outFps: settings.outFps,
+                                    hdr: settings.hdrEnabled,
+                                    totalSegments: segments,
+                                    done: Array(done).sorted(),
+                                    createdAt: Date().timeIntervalSince1970))
+        }
+        let startDone = done
+
         task = Task { [weak self] in
             let result: Result<VideoRenderer.Report, Error> = await withCheckedContinuation { cont in
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
-                        let report = try VideoRenderer.render(
-                            source: source,
-                            dest: dest,
-                            settings: settings,
-                            box: box,
-                            control: ctl,
-                            onFrame: { done, total in
-                                Task { @MainActor [weak self] in
-                                    guard let self else { return }
-                                    self.framesDone = done
-                                    self.framesTotal = max(total, totalOut)
-                                    self.progress = min(0.995, Double(done) / Double(max(1, total)))
-                                    if self.progress > 0.02 {
-                                        self.status = "\(self.startStatus()) \(done) / \(max(total, totalOut)) 帧"
-                                    }
-                                }
-                            },
-                            onNotice: { message in
-                                Task { @MainActor [weak self] in
-                                    self?.notice = message
+                        let onFrame: @Sendable (Int, Int) -> Void = { doneFrames, total in
+                            Task { @MainActor [weak self] in
+                                guard let self else { return }
+                                self.framesDone = doneFrames
+                                self.framesTotal = max(total, totalOut)
+                                self.progress = min(0.995, Double(doneFrames) / Double(max(1, totalOut)))
+                                if self.progress > 0.02 {
+                                    self.status = "\(self.startStatus()) \(doneFrames) / \(max(total, totalOut)) 帧"
                                 }
                             }
-                        )
+                        }
+                        let onNotice: @Sendable (String) -> Void = { message in
+                            Task { @MainActor [weak self] in
+                                self?.notice = message
+                            }
+                        }
+                        let report: VideoRenderer.Report
+                        if segments > 1 {
+                            report = try VideoRenderer.renderSegmented(
+                                source: source,
+                                dest: dest,
+                                settings: settings,
+                                box: box,
+                                control: ctl,
+                                sessionDir: sessionDir,
+                                doneSegments: startDone,
+                                totalSegments: segments,
+                                onFrame: onFrame,
+                                onSegment: { index, total in
+                                    JobStore.markDone(key: jobKey, segment: index)
+                                    Task { @MainActor [weak self] in
+                                        self?.status = "\(self?.startStatus() ?? "") 分片 \(index + 1) / \(total) 完成"
+                                    }
+                                },
+                                onNotice: onNotice)
+                        } else {
+                            report = try VideoRenderer.render(
+                                source: source,
+                                dest: dest,
+                                settings: settings,
+                                box: box,
+                                control: ctl,
+                                onFrame: onFrame,
+                                onNotice: onNotice)
+                        }
                         cont.resume(returning: .success(report))
                     } catch {
                         cont.resume(returning: .failure(error))
@@ -1185,6 +1353,10 @@ final class VideoEngine: ObservableObject {
                 let mb = max(1, bytes / 1_048_576)
                 self.outputLabel = "\(p.width) × \(p.height) · \(report.frames) 帧 · \(mb) MB"
                 self.status = "完成"
+                if segments > 1 {
+                    JobStore.clear(key: jobKey)
+                    try? FileManager.default.removeItem(at: sessionDir)
+                }
             case .failure(let error):
                 self.progress = 0
                 self.status = ""
@@ -1255,5 +1427,109 @@ final class VideoEngine: ObservableObject {
         } catch {
             notice = "保存失败：\(error.localizedDescription)"
         }
+    }
+
+    // MARK: 断点续传
+
+    /// 当前素材 + 当前设置是否存在未完成的分片任务。
+    func pendingJobSummary(for clip: VideoClip) -> String? {
+        let key = JobStore.key(source: clip.url, settings: settings(for: clip))
+        guard let record = JobStore.load(key: key),
+              !record.done.isEmpty,
+              record.done.count < record.totalSegments else { return nil }
+        let minutes = Double(record.done.count) * VideoRenderer.segmentSeconds / 60
+        return "上次还剩 \(record.totalSegments - record.done.count) 个分片（已完成约 \(String(format: "%.1f", minutes)) 分钟素材）"
+    }
+
+    func discardPendingJob(for clip: VideoClip) {
+        let key = JobStore.key(source: clip.url, settings: settings(for: clip))
+        JobStore.clear(key: key)
+        notice = "已丢弃未完成的分片"
+        objectWillChange.send()
+    }
+
+    /// 把当前 UI 选择落成一次渲染的参数，供 start() 与断点查询共用。
+    private func settings(for clip: VideoClip) -> VideoSettings {
+        let p = plan(for: clip)
+        return VideoSettings(targetWidth: p.width,
+                             targetHeight: p.height,
+                             useAI: mode == .ai,
+                             aiLongEdge: p.aiLongEdge,
+                             duration: clip.duration,
+                             outFps: p.outFps,
+                             samplesPerPair: p.samplesPerPair,
+                             blurSamples: blur.samples,
+                             keepAudio: p.keepAudio,
+                             expectedFrames: p.frames,
+                             hdrEnabled: hdrEnabled,
+                             hdrIntensity: hdrIntensity)
+    }
+}
+
+// MARK: - 分片任务记录
+
+struct JobRecord: Codable, Sendable {
+    var key: String
+    var sourcePath: String
+    var width: Int
+    var height: Int
+    var outFps: Double
+    var hdr: Bool
+    var totalSegments: Int
+    var done: [Int]
+    var createdAt: Double
+}
+
+enum JobStore {
+    static var root: URL {
+        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return base.appendingPathComponent("PixelLiftJobs", isDirectory: true)
+    }
+
+    static func dir(for key: String) -> URL {
+        root.appendingPathComponent(key, isDirectory: true)
+    }
+
+    static func key(source: URL, settings: VideoSettings) -> String {
+        let descriptor = [
+            source.path,
+            "\(settings.targetWidth)x\(settings.targetHeight)",
+            String(format: "%.3f", settings.outFps),
+            settings.useAI ? "ai\(settings.aiLongEdge)" : "fast",
+            "p\(settings.samplesPerPair)b\(settings.blurSamples)",
+            settings.hdrEnabled ? "hdr" : "sdr"
+        ].joined(separator: "|")
+        return SHA256.hash(data: Data(descriptor.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+            .prefix(24)
+            .description
+    }
+
+    static func load(key: String) -> JobRecord? {
+        let url = dir(for: key).appendingPathComponent("job.json")
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? JSONDecoder().decode(JobRecord.self, from: data)
+    }
+
+    static func save(_ record: JobRecord) {
+        let folder = dir(for: record.key)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(record) else { return }
+        try? data.write(to: folder.appendingPathComponent("job.json"), options: .atomic)
+    }
+
+    static func markDone(key: String, segment: Int) {
+        guard var record = load(key: key) else { return }
+        if !record.done.contains(segment) {
+            record.done.append(segment)
+            record.done.sort()
+        }
+        save(record)
+    }
+
+    static func clear(key: String) {
+        try? FileManager.default.removeItem(at: dir(for: key))
     }
 }

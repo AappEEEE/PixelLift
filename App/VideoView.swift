@@ -43,6 +43,7 @@ struct VideoView: View {
                         scaleCard(clip)
                         motionCard(clip)
                         hdrCard
+                        resumeCard(clip)
                         actionCard(clip)
                     }
                     if let notice = engine.notice {
@@ -288,6 +289,38 @@ struct VideoView: View {
         .padding(16)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
         .disabled(engine.isRunning)
+    }
+
+    private func resumeCard(_ clip: VideoClip) -> some View {
+        Group {
+            if !engine.isRunning, let hint = engine.pendingJobSummary(for: clip) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("有未完成的分片任务", systemImage: "arrow.clockwise.circle")
+                        .font(.headline)
+                    Text(hint)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("分片按 20 秒切段，每段编码成一个文件，最后 passthrough 拼接（不重编码）。HDR 模式为了保证 10-bit 元数据不丢，只做单条输出、不支持续传。")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 10) {
+                        Button {
+                            engine.resumePendingJob()
+                        } label: {
+                            Label("接着做", systemImage: "play.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("丢弃", role: .destructive) {
+                            engine.discardPendingJob(for: clip)
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                }
+                .padding(16)
+                .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+            }
+        }
     }
 
     private func actionCard(_ clip: VideoClip) -> some View {
