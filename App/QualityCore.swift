@@ -150,7 +150,7 @@ enum QualityCore {
                                 guard let hip = hiBuf.baseAddress else { return }
 
                                 let planes = Planes(luma: lp, temp: tp, base: bp, low: lop, high: hip)
-                                let dst: UnsafeMutablePointer<UInt8> = rgbaBase.assumingMemoryBound(to: UInt8)
+                                let dst: UnsafeMutablePointer<UInt8> = rgbaBase.assumingMemoryBound(to: UInt8.self)
 
                                 ok = runStrips(rgba: dst,
                                                planes: planes,
@@ -394,6 +394,7 @@ enum QualityCore {
                                                            kernelHeight,
                                                            kernelWidth,
                                                            divisor,
+                                                           0,
                                                            vImage_Flags(kvImageEdgeExtend))
             ok = (err == kvImageNoError)
         }
