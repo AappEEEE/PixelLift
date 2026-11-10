@@ -43,6 +43,7 @@ struct VideoView: View {
                         scaleCard(clip)
                         motionCard(clip)
                         hdrCard
+                        detailCard
                         resumeCard(clip)
                         actionCard(clip)
                     }
@@ -285,6 +286,28 @@ struct VideoView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        .disabled(engine.isRunning)
+    }
+
+    private var detailCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label("细节增强", systemImage: "wand.and.rays")
+                .font(.headline)
+            HStack {
+                Text("锐度")
+                    .font(.caption)
+                Slider(value: $engine.detail, in: 0...1, step: 0.05)
+                Text("\(Int(engine.detail * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+            }
+            Text("缩放到目标尺寸后做一遍轻微 USM，把重采样吃掉的高频补回来。0 表示完全不加，20–40% 通常最自然也最安全。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
         }
         .padding(16)
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))

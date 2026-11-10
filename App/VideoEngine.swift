@@ -124,6 +124,7 @@ struct VideoSettings: Sendable {
     var expectedFrames: Int
     var hdrEnabled: Bool
     var hdrIntensity: Double
+    var detail: Double
 }
 
 /// MLModel 不是 Sendable，用盒子跨线程传
@@ -539,6 +540,37 @@ enum FrameOps {
         }
     }
 
+    /// 轻量 USM：3×3 盒式模糊做低频，按 amount 把高频加回去。
+    /// 缩放后画面天然偏软，这一步相当于 Topaz 的 «Add Detail»，但幅度小、不产生明显白边。
+    static func unsharp(_ rgba: inout [UInt8], w: Int, h: Int, amount: Float) {
+        guard amount > 0.001, w > 2, h > 2 else { return }
+        let n = w * h * 4
+        guard rgba.count >= n else { return }
+        var src = rgba
+        src.withUnsafeBufferPointer { sBuf in
+            rgba.withUnsafeMutableBufferPointer { dBuf in
+                for y in 1..<(h - 1) {
+                    for x in 1..<(w - 1) {
+                        let o = (y * w + x) * 4
+                        for c in 0..<3 {
+                            var sum: Float = 0
+                            for dy in -1...1 {
+                                for dx in -1...1 {
+                                    sum += Float(sBuf[o + dy * w * 4 + dx * 4 + c])
+                                }
+                            }
+                            let low = sum / 9
+                            let high = Float(sBuf[o + c]) - low
+                            let v = Float(sBuf[o + c]) + high * amount
+                            dBuf[o + c] = UInt8(min(255, max(0, v.rounded())))
+                        }
+                        dBuf[o + 3] = 255
+                    }
+                }
+            }
+        }
+    }
+
     /// out = out * (1 - weight) + src * weight
     static func average(into out: inout [UInt8], from src: [UInt8], weight: Float) {
         let n = min(out.count, src.count)
@@ -747,6 +779,24 @@ enum VideoRenderer {
             onFrame(baseFrames + outIndex, totalOut)
         }
 
+        // 快门采样：三角权重（中间重、两端轻）比等权平均更像真实快门的连续曝光，
+        // 运动物体的拖影过渡更平滑，也不会出现等权平均那种「台阶」。
+        let blurOffsets: [Float]
+        let blurWeights: [Float]
+        do {
+            var offsets: [Float] = []
+            var weights: [Float] = []
+            let spread = 0.40 / Float(max(2, perPair))
+            let half = max(1.0, (Float(blurSamples) - 1) * 0.5)
+            for j in 0..<blurSamples {
+                let x = Float(j) - (Float(blurSamples) - 1) * 0.5
+                offsets.append(x * spread)
+                weights.append(max(0.08, 1 - abs(x) / (half + 0.5)))
+            }
+            blurOffsets = offsets
+            blurWeights = weights
+        }
+
         func emit(_ a: [UInt8], _ b: [UInt8], t: Float,
                   flow: FlowField?, flowScale: Float) throws {
             if blurSamples <= 1 {
@@ -755,16 +805,16 @@ enum VideoRenderer {
                 try writeFrame(scratch)
                 return
             }
-            let spread = 0.35 / Float(max(2, perPair))
+            var cumulative: Float = 0
             for j in 0..<blurSamples {
-                let offset = (Float(j) - (Float(blurSamples) - 1) * 0.5) * spread
-                let tj = min(1, max(0, t + offset))
+                let tj = min(1, max(0, t + blurOffsets[j]))
                 FrameOps.synthesize(a: a, b: b, w: tw, h: th,
                                     flow: flow, flowScale: flowScale, t: tj, out: &scratch)
+                cumulative += blurWeights[j]
                 if j == 0 {
                     accum = scratch
                 } else {
-                    FrameOps.average(into: &accum, from: scratch, weight: 1.0 / Float(j + 1))
+                    FrameOps.average(into: &accum, from: scratch, weight: blurWeights[j] / cumulative)
                 }
             }
             try writeFrame(accum)
@@ -1015,7 +1065,11 @@ enum VideoRenderer {
         } else {
             finalCG = Pix.resized(cg, width: tw, height: th) ?? cg
         }
-        return Pix.rgba(finalCG, width: tw, height: th)
+        guard var out = Pix.rgba(finalCG, width: tw, height: th) else { return nil }
+        if settings.detail > 0.001 {
+            FrameOps.unsharp(&out, w: tw, h: th, amount: Float(settings.detail))
+        }
+        return out
     }
 }
 
@@ -1032,6 +1086,7 @@ final class VideoEngine: ObservableObject {
     @Published var blur: BlurMode = .off
     @Published var hdrEnabled = false
     @Published var hdrIntensity: Double = 0.65
+    @Published var detail: Double = 0.25
     @Published var isRunning = false
     @Published var isPaused = false
     @Published var progress: Double = 0
@@ -1184,7 +1239,16 @@ final class VideoEngine: ObservableObject {
             }
         }
 
-        var aiEdge = min(1280, max(384, Int((Double(max(tw, th)) / 4.0).rounded())))
+        // AI 输入尽量贴近原片分辨率：4× 重建后再缩到目标尺寸等于超采样，比「先缩小再重建」锐利得多。
+        // 代价是缓冲变大，所以按 4× 输出不超过 24MP 反推允许的长边。
+        var aiEdge = min(2048, max(w0, h0))
+        let aspect = Double(h0) / Double(max(1, w0))
+        let budgetPixels = 24_000_000.0
+        while aiEdge > 320 {
+            let outPixels = Double(aiEdge * 4) * Double(aiEdge * 4) * aspect
+            if outPixels <= budgetPixels { break }
+            aiEdge = Int(Double(aiEdge) * 0.92)
+        }
         if aiEdge > max(w0, h0) { aiEdge = max(w0, h0) }
 
         let outFps = max(1.0, min(240.0, clip.fps * Double(factor)))
@@ -1195,7 +1259,7 @@ final class VideoEngine: ObservableObject {
             let perFrame = Double(aiEdge * aiEdge) / (192.0 * 192.0)
             let aiSeconds = perFrame * 0.045 * Double(srcFrames)
             if aiSeconds > 60 {
-                notes.append(String(format: "AI 模式光推理就要 %.0f 分钟，建议先剪短或用快速放大", aiSeconds / 60))
+                notes.append(String(format: "AI 输入长边 %dpx，光推理约 %.0f 分钟，建议先剪短或用快速放大", aiEdge, aiSeconds / 60))
             }
         }
         if frames > 5400 {
@@ -1241,7 +1305,8 @@ final class VideoEngine: ObservableObject {
                                      keepAudio: p.keepAudio,
                                      expectedFrames: p.frames,
                                       hdrEnabled: hdrEnabled,
-                                      hdrIntensity: hdrIntensity)
+                                      hdrIntensity: hdrIntensity,
+                                      detail: detail)
         let dest = FileManager.default.temporaryDirectory
             .appendingPathComponent("PixelLift-video-\(Int(Date().timeIntervalSince1970)).mp4")
         let box = ModelBox(models[modelKind] ?? models[.photo])
@@ -1375,6 +1440,7 @@ final class VideoEngine: ObservableObject {
         if interp != .off { parts.append("补帧 \(interp.title)") }
         if slow != .normal { parts.append("慢动作 \(slow.title)") }
         if blur != .off { parts.append("动态模糊 \(blur.title)") }
+        if detail > 0.001 { parts.append("细节 \(Int(detail * 100))%") }
         if hdrEnabled { parts.append("SDR→HLG \(Int(hdrIntensity * 100))%") }
         return parts.joined(separator: " + ")
     }
@@ -1462,7 +1528,8 @@ final class VideoEngine: ObservableObject {
                              keepAudio: p.keepAudio,
                              expectedFrames: p.frames,
                              hdrEnabled: hdrEnabled,
-                             hdrIntensity: hdrIntensity)
+                             hdrIntensity: hdrIntensity,
+                             detail: detail)
     }
 }
 
