@@ -1332,7 +1332,7 @@ final class VideoEngine: ObservableObject {
         let sessionDir = JobStore.dir(for: jobKey)
         var done: Set<Int> = []
         if resuming, segments > 1 {
-            done = JobStore.load(key: jobKey)?.done ?? []
+            done = Set(JobStore.load(key: jobKey)?.done ?? [])
         } else if segments > 1 {
             try? FileManager.default.removeItem(at: sessionDir)
         }
