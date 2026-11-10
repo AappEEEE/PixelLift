@@ -546,8 +546,11 @@ enum FrameOps {
     static func unsharp(_ rgba: inout [UInt8], w: Int, h: Int, amount: Float) {
         guard amount > 0.001, w > 2, h > 2, rgba.count >= w * h * 4 else { return }
         let a = Double(amount)
-        let neg = Int16((-a / 9.0 * 256.0).rounded())
-        let center = Int16(((1.0 + a) - a / 9.0) * 256.0).rounded()
+        let scale = 256.0
+        let negValue = (-a / 9.0) * scale
+        let centerValue = ((1.0 + a) - a / 9.0) * scale
+        let neg: Int16 = Int16(negValue.rounded())
+        let center: Int16 = Int16(centerValue.rounded())
         var kernel: [Int16] = [neg, neg, neg, neg, center, neg, neg, neg, neg]
         var background: [UInt8] = [0, 0, 0, 0]
         rgba.withUnsafeMutableBytes { raw in
