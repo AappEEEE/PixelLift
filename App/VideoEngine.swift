@@ -1117,7 +1117,32 @@ final class VideoEngine: ObservableObject {
     @Published var outputLabel: String = ""
     @Published var framesDone: Int = 0
     @Published var framesTotal: Int = 0
+    @Published var etaSeconds: Double?
 
+    private var runStart: Date?
+    private var pausedAt: Date?
+    private var pausedTotal: TimeInterval = 0
+
+    /// 实际有效运行时长：扣掉中途暂停的时间，否则暂停越久 ETA 越离谱。
+    private func effectiveElapsed() -> TimeInterval? {
+        guard let start = runStart else { return nil }
+        var elapsed = Date().timeIntervalSince(start) - pausedTotal
+        if let pausedAt { elapsed -= Date().timeIntervalSince(pausedAt) }
+        return max(0, elapsed)
+    }
+
+    /// 把剩余秒数格式化成一行提示；数据不足时返回空串。
+    static func etaText(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite, seconds > 0 else { return "" }
+        let total = Int(seconds.rounded())
+        if total >= 3600 {
+            return String(format: " · 剩余 %d 时 %02d 分", total / 3600, (total % 3600) / 60)
+        }
+        if total >= 60 {
+            return String(format: " · 剩余 %d 分 %02d 秒", total / 60, total % 60)
+        }
+        return " · 剩余 \(total) 秒"
+    }
     private var models: [ModelKind: MLModel] = [:]
     private var control: RunControl?
     private var task: Task<Void, Never>?
@@ -1338,6 +1363,10 @@ final class VideoEngine: ObservableObject {
         progress = 0
         framesDone = 0
         framesTotal = p.frames
+        etaSeconds = nil
+        runStart = Date()
+        pausedAt = nil
+        pausedTotal = 0
         status = startStatus()
         outputURL = nil
         outputLabel = ""
@@ -1380,8 +1409,14 @@ final class VideoEngine: ObservableObject {
                                 self.framesDone = doneFrames
                                 self.framesTotal = max(total, totalOut)
                                 self.progress = min(0.995, Double(doneFrames) / Double(max(1, totalOut)))
+                                if let elapsed = self.effectiveElapsed(), doneFrames > 2, elapsed > 0.5 {
+                                    let perFrame = elapsed / Double(doneFrames)
+                                    let remaining = perFrame * Double(max(0, max(total, totalOut) - doneFrames))
+                                    self.etaSeconds = remaining
+                                }
                                 if self.progress > 0.02 {
-                                    self.status = "\(self.startStatus()) \(doneFrames) / \(max(total, totalOut)) 帧"
+                                    let tail = VideoEngine.etaText(self.etaSeconds)
+                                    self.status = "\(self.startStatus()) \(doneFrames) / \(max(total, totalOut)) 帧\(tail)"
                                 }
                             }
                         }
@@ -1430,6 +1465,8 @@ final class VideoEngine: ObservableObject {
             self.isRunning = false
             self.isPaused = false
             self.control = nil
+            self.runStart = nil
+            self.etaSeconds = nil
             switch result {
             case .success(let report):
                 self.progress = 1
@@ -1470,6 +1507,7 @@ final class VideoEngine: ObservableObject {
         guard isRunning else { return }
         control?.setPaused(true)
         isPaused = true
+        pausedAt = Date()
         status = "已暂停"
     }
 
@@ -1477,6 +1515,10 @@ final class VideoEngine: ObservableObject {
         guard isRunning else { return }
         control?.setPaused(false)
         isPaused = false
+        if let pausedAt {
+            pausedTotal += Date().timeIntervalSince(pausedAt)
+            self.pausedAt = nil
+        }
         status = startStatus()
     }
 
@@ -1492,6 +1534,8 @@ final class VideoEngine: ObservableObject {
         progress = 0
         status = ""
         framesDone = 0
+        etaSeconds = nil
+        runStart = nil
     }
 
     // MARK: 保存
