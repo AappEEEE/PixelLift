@@ -25,7 +25,7 @@ struct VideoClip: Identifiable, Equatable {
     var sizeLabel: String { "\(renderWidth) × \(renderHeight)" }
     var durationLabel: String {
         let total = Int(duration.rounded())
-        return String(format: "%d:%02d", total / 60, total % 60)
+        return "\(total / 60):" + String(format: "%02d", total % 60)
     }
     var fpsLabel: String { String(format: "%.0f fps", fps) }
 }
@@ -89,25 +89,16 @@ enum SlowMode: String, CaseIterable, Identifiable {
     }
 }
 
-/// 动态模糊：把相邻几个补帧采样按权重叠起来，模拟快门拖影
+/// 动态模糊：按快门角在曝光窗内做时间积分（强度由快门角决定，不再分「轻/强」）
 enum BlurMode: String, CaseIterable, Identifiable {
     case off
-    case soft
-    case strong
+    case on
 
     var id: String { rawValue }
-    var samples: Int {
-        switch self {
-        case .off: return 1
-        case .soft: return 3
-        case .strong: return 5
-        }
-    }
     var title: String {
         switch self {
         case .off: return "关闭"
-        case .soft: return "轻"
-        case .strong: return "强"
+        case .on: return "开启"
         }
     }
 }
@@ -120,7 +111,12 @@ struct VideoSettings: Sendable {
     var duration: Double
     var outFps: Double
     var samplesPerPair: Int
-    var blurSamples: Int
+    /// 快门角，0 表示关闭动态模糊。单位：度。
+    var shutterAngle: Double
+    /// 平均每像素采样数上限（成本闸门）。
+    var blurSampleBudget: Int
+    /// 是否在线性光域累积。关掉只是省几个百分点，画质会掉，留作降级开关。
+    var blurLinearLight: Bool
     var keepAudio: Bool
     var expectedFrames: Int
     var hdrEnabled: Bool
@@ -751,7 +747,15 @@ enum VideoRenderer {
         }
 
         let perPair = max(1, settings.samplesPerPair)
-        let blurSamples = max(1, settings.blurSamples)
+        // M6：模糊参数在一对帧内是常量，先算好，逐帧只做相位积分。
+        // 窗宽 W = (快门角/360)/perPair，锚定在帧起点，所以 t+W 恒 <= 1。
+        let blurPlan: MotionBlurCore.Plan = MotionBlurCore.makePlan(
+            angleDegrees: settings.shutterAngle,
+            perPair: perPair,
+            sampleBudget: settings.blurSampleBudget,
+            linearLight: settings.blurLinearLight,
+            adaptive: true)
+        let blurOn: Bool = blurPlan.enabled
         let totalOut = max(1, settings.expectedFrames)
         let outFps = max(1.0, settings.outFps)
 
@@ -765,6 +769,9 @@ enum VideoRenderer {
         var accum = [UInt8](repeating: 0, count: tw * th * 4)
         var stable = [UInt8](repeating: 0, count: tw * th * 4)
         var prevStable: [UInt8]?
+        // 线性光累积缓冲：tw*th*3 个 Float，1.4MP 输出约 16.8MB。首次 compose 时按需扩容，之后复用。
+        var blurLight: [Float] = []
+        var reportedBlurCost = false
         // AI 逐帧超分天然会抖：只在这种模式下做时域融合，快速放大已经足够稳定。
         let temporalWeight: Float = settings.useAI ? 0.22 : 0
 
@@ -799,43 +806,22 @@ enum VideoRenderer {
             onFrame(baseFrames + outIndex, totalOut)
         }
 
-        // 快门采样：三角权重（中间重、两端轻）比等权平均更像真实快门的连续曝光，
-        // 运动物体的拖影过渡更平滑，也不会出现等权平均那种「台阶」。
-        let blurPlan: (offsets: [Float], weights: [Float]) = {
-            var offsets: [Float] = []
-            var weights: [Float] = []
-            let spread = 0.40 / Float(max(2, perPair))
-            let half = max(1.0, (Float(blurSamples) - 1) * 0.5)
-            for j in 0..<blurSamples {
-                let x = Float(j) - (Float(blurSamples) - 1) * 0.5
-                offsets.append(x * spread)
-                weights.append(max(0.08, 1 - abs(x) / (half + 0.5)))
-            }
-            return (offsets, weights)
-        }()
-        let blurOffsets = blurPlan.offsets
-        let blurWeights = blurPlan.weights
-
+        // M6 动态模糊：在曝光窗 [t, t+W] 内做加权时间积分，而不是把几帧糊在一起。
+        // W = (快门角/360)/perPair，窗口锚定帧起点 => t+W <= 1 恒成立：
+        // 不需要第三帧、不需要第二条光流、所有输出帧积分区间等长（无清晰/模糊闪烁）。
         func emit(_ a: [UInt8], _ b: [UInt8], t: Float,
                   flow: FlowField?, flowScale: Float) throws {
-            if blurSamples <= 1 {
+            if !blurOn {
                 FrameOps.synthesize(a: a, b: b, w: tw, h: th,
                                     flow: flow, flowScale: flowScale, t: t, out: &scratch)
                 try writeFrame(scratch)
                 return
             }
-            var cumulative: Float = 0
-            for j in 0..<blurSamples {
-                let tj = min(1, max(0, t + blurOffsets[j]))
-                FrameOps.synthesize(a: a, b: b, w: tw, h: th,
-                                    flow: flow, flowScale: flowScale, t: tj, out: &scratch)
-                cumulative += blurWeights[j]
-                if j == 0 {
-                    accum = scratch
-                } else {
-                    FrameOps.average(into: &accum, from: scratch, weight: blurWeights[j] / cumulative)
-                }
-            }
+            MotionBlurCore.compose(a: a, b: b, width: tw, height: th, t: t,
+                                   flow: flow, flowScale: flowScale,
+                                   plan: blurPlan,
+                                   scratchLinear: &blurLight,
+                                   out: &accum)
             try writeFrame(accum)
         }
 
@@ -876,12 +862,22 @@ enum VideoRenderer {
                                       onNotice: onNotice) else { continue }
 
             if let prev = prevBuf, prev.count == buf.count {
-                let needsInterp = perPair > 1 || blurSamples > 1
+                let needsInterp = perPair > 1 || blurOn
                 let needsFlow = needsInterp || temporalWeight > 0
                 let flow: FlowField? = needsFlow && prevCG != nil
                     ? FrameOps.flow(from: prevCG!, to: cg)
                     : nil
                 let flowScale: Float = flow.map { Float(tw) / Float($0.w) } ?? 1
+
+                // 只在第一对帧报一次，让用户/日志看得到实际采样密度。
+                if blurOn, !reportedBlurCost, let flow {
+                    reportedBlurCost = true
+                    let avg: Float = MotionBlurCore.estimateAverageSamples(
+                        flow: flow, flowScale: flowScale,
+                        width: tw, height: th, plan: blurPlan)
+                    onNotice("动态模糊 \(Int(settings.shutterAngle))° · 平均 "
+                             + String(format: "%.2f", Double(avg)) + " 次采样/像素")
+                }
 
                 // 当前帧先做时域融合，再和上一帧合成中间帧；两端都用稳定后的结果，时间轴不乱。
                 var outBuf = buf
@@ -976,7 +972,7 @@ enum VideoRenderer {
         let fpsPerSegment = framesPerSegment(outFps: settings.outFps)
 
         for seg in 0..<totalSegments {
-            let url = sessionDir.appendingPathComponent(String(format: "seg-%04d.mp4", seg))
+            let url = sessionDir.appendingPathComponent(String(format: "seg-%04d.mp4", Int32(seg)))
             urls.append(url)
             let exists = FileManager.default.fileExists(atPath: url.path)
             if doneSegments.contains(seg), exists { continue }
@@ -1105,6 +1101,8 @@ final class VideoEngine: ObservableObject {
     @Published var interp: InterpMode = .off
     @Published var slow: SlowMode = .normal
     @Published var blur: BlurMode = .off
+    @Published var shutterAngle: ShutterAngle = .deg180
+    @Published var blurQuality: BlurQuality = .standard
     @Published var hdrEnabled = false
     @Published var hdrIntensity: Double = 0.65
     @Published var detail: Double = 0.25
@@ -1136,10 +1134,10 @@ final class VideoEngine: ObservableObject {
         guard let seconds, seconds.isFinite, seconds > 0 else { return "" }
         let total = Int(seconds.rounded())
         if total >= 3600 {
-            return String(format: " · 剩余 %d 时 %02d 分", total / 3600, (total % 3600) / 60)
+            return " · 剩余 \(total / 3600) 时 " + String(format: "%02d", (total % 3600) / 60) + " 分"
         }
         if total >= 60 {
-            return String(format: " · 剩余 %d 分 %02d 秒", total / 60, total % 60)
+            return " · 剩余 \(total / 60) 分 " + String(format: "%02d", total % 60) + " 秒"
         }
         return " · 剩余 \(total) 秒"
     }
@@ -1243,19 +1241,21 @@ final class VideoEngine: ObservableObject {
         let factor = interp.factor
         let slowFactor = slow.factor
         let perPair = max(1, Int((Double(factor) / slowFactor).rounded()))
-        let blurSamples = blur.samples
+        let blurOn = blur == .on
+        let blurBudget = blurQuality.budget
 
         var capEdge = capLongEdge
         var capPix = capPixels
-        if perPair > 1 || blurSamples > 1 {
+        if perPair > 1 || blurOn {
             capEdge = min(capEdge, 1920)
             capPix = min(capPix, 2_100_000)
             notes.append("补帧/慢动作把输出限制在 1080p 级，否则一帧要几百毫秒")
         }
-        if blurSamples > 1 {
+        if blurOn {
             capEdge = min(capEdge, 1440)
             capPix = min(capPix, 1_400_000)
-            notes.append("动态模糊是 \(blurSamples) 次合成，输出再降一档")
+            let deg = Int(shutterAngle.degrees)
+            notes.append("动态模糊 \(deg)° 快门、预算 \(blurBudget) 样本/像素，输出再降一档")
         }
 
         let edgeScale = min(Double(capEdge) / Double(max(tw, th)), 1)
@@ -1305,7 +1305,7 @@ final class VideoEngine: ObservableObject {
             let perFrame = Double(aiEdge * aiEdge) / (192.0 * 192.0)
             let aiSeconds = perFrame * 0.045 * Double(srcFrames)
             if aiSeconds > 60 {
-                notes.append(String(format: "AI 输入长边 %dpx，光推理约 %.0f 分钟，建议先剪短或用快速放大", aiEdge, aiSeconds / 60))
+                notes.append("AI 输入长边 \(aiEdge)px，光推理约 " + String(format: "%.0f", aiSeconds / 60) + " 分钟，建议先剪短或用快速放大")
             }
         }
         if frames > 5400 {
@@ -1347,7 +1347,9 @@ final class VideoEngine: ObservableObject {
                                      duration: clip.duration,
                                      outFps: p.outFps,
                                      samplesPerPair: p.samplesPerPair,
-                                     blurSamples: blur.samples,
+                                     shutterAngle: blur == .on ? shutterAngle.degrees : 0,
+                                     blurSampleBudget: blurQuality.budget,
+                                     blurLinearLight: true,
                                      keepAudio: p.keepAudio,
                                      expectedFrames: p.frames,
                                       hdrEnabled: hdrEnabled,
@@ -1497,7 +1499,7 @@ final class VideoEngine: ObservableObject {
         parts.append(mode == .ai ? "AI 逐帧超分" : "解码 + 重采样")
         if interp != .off { parts.append("补帧 \(interp.title)") }
         if slow != .normal { parts.append("慢动作 \(slow.title)") }
-        if blur != .off { parts.append("动态模糊 \(blur.title)") }
+        if blur == .on { parts.append("动态模糊 \(shutterAngle.title)") }
         if detail > 0.001 { parts.append("细节 \(Int(detail * 100))%") }
         if hdrEnabled { parts.append("SDR→HLG \(Int(hdrIntensity * 100))%") }
         return parts.joined(separator: " + ")
@@ -1589,7 +1591,9 @@ final class VideoEngine: ObservableObject {
                              duration: clip.duration,
                              outFps: p.outFps,
                              samplesPerPair: p.samplesPerPair,
-                             blurSamples: blur.samples,
+                             shutterAngle: blur == .on ? shutterAngle.degrees : 0,
+                             blurSampleBudget: blurQuality.budget,
+                             blurLinearLight: true,
                              keepAudio: p.keepAudio,
                              expectedFrames: p.frames,
                              hdrEnabled: hdrEnabled,
@@ -1629,7 +1633,7 @@ enum JobStore {
             "\(settings.targetWidth)x\(settings.targetHeight)",
             String(format: "%.3f", settings.outFps),
             settings.useAI ? "ai\(settings.aiLongEdge)" : "fast",
-            "p\(settings.samplesPerPair)b\(settings.blurSamples)",
+            "p\(settings.samplesPerPair)a\(Int(settings.shutterAngle))m\(settings.blurSampleBudget)l\(settings.blurLinearLight ? "1" : "0")",
             settings.hdrEnabled ? "hdr" : "sdr"
         ].joined(separator: "|")
         return SHA256.hash(data: Data(descriptor.utf8))

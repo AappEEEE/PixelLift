@@ -1,4 +1,4 @@
-# Xcode / SPM
+﻿# Xcode / SPM
 build/
 DerivedData/
 *.xcodeproj
@@ -22,3 +22,5 @@ _lc/
 # 本地产物 / 用户素材
 微信图片*
 docs/quality/
+__pycache__/
+*.pyc

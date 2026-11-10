@@ -249,6 +249,35 @@ struct VideoView: View {
                 .disabled(engine.isRunning)
             }
 
+            if engine.blur == .on {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("快门角").font(.subheadline)
+                    Picker("快门角", selection: $engine.shutterAngle) {
+                        ForEach(ShutterAngle.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(engine.isRunning)
+
+                    Text("180° 是电影标准；360° 等于整帧曝光，拖影最长。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Picker("采样预算", selection: $engine.blurQuality) {
+                        ForEach(BlurQuality.allCases) { item in
+                            Text(item.title).tag(item)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(engine.isRunning)
+
+                    Text("预算 = 平均每像素采样数上限，越高拖影越平滑，耗时近似线性增长。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Text(String(format: "输出 %.0f fps · 约 %@ 帧 · %@",
                         plan.outFps,
                         "\(plan.frames)",
@@ -440,11 +469,11 @@ struct VideoView: View {
                         .font(.footnote)
 
                     Text("补帧 / 慢动作 / 动态模糊").font(.headline)
-                    Text("· 补帧：用 Vision 的光流算出每个像素的运动方向，在相邻两帧之间合成中间帧，所以 ×2 就是把 30fps 变成 60fps，运动更顺；\n· 慢动作：把时间轴拉长，多出来的每一帧同样是光流补出来的，(补帧 ×2 + 慢动作 0.5×) 一秒钟要补 4 帧；\n· 动态模糊：把同一时刻前后几个补帧采样叠起来，模拟快门拖影；\n· 慢动作会改变时长，所以这一单不带原音轨；只补帧不改时长时音频照原样透传。")
+                    Text("· 补帧：用 Vision 的光流算出每个像素的运动方向，在相邻两帧之间合成中间帧，所以 ×2 就是把 30fps 变成 60fps，运动更顺；\n· 慢动作：把时间轴拉长，多出来的每一帧同样是光流补出来的，(补帧 ×2 + 慢动作 0.5×) 一秒钟要补 4 帧；\n· 动态模糊：沿真实快门在曝光窗内做时间积分，180° 相当于半帧曝光，360° 是整帧曝光、拖影最长；采样密度按运动速度自适应，静止画面不额外花时间；\n· 慢动作会改变时长，所以这一单不带原音轨；只补帧不改时长时音频照原样透传。")
                         .font(.footnote)
 
                     Text("SDR → HDR (HLG)").font(.headline)
-                    Text("· 打开后输出 HEVC Main10 / P010 10-bit、Rec.2020 色域和 BT.2100 HLG 传递函数；滑杆控制高光肩部强度，不会凭空恢复输入 SDR 已裁掉的高光纹理；\n· SDR 白映射到 HLG 参考白，观感取决于源片、播放器的色彩管理与显示器峰值亮度；请用支持 HLG 的设备核对；\n· 为降低 P010 编码开销，HDR 模式最高约 1080p / 2.1MP。当前没有在真机和 HDR 显示器做主观画质验收。")
+                    Text("· 打开后输出 HEVC Main10 / P010 10-bit、Rec.2020 色域和 BT.2100 HLG 传递函数；滑杆控制高光肩部强度，不会凭空恢复输入 SDR 已裁掉的高光纹理；\n· SDR 白映射到 HLG 参考白，观感取决于源片、播放器的色彩管理与显示器峰值亮度；请用支持 HLG 的设备核对；\n· 输出上限与 SDR 相同（4K / 830 万像素），码率按 0.12 bit/像素 折算。当前还没有在真机和 HDR 显示器做主观画质验收。")
                         .font(.footnote)
 
                     Text("本版限制").font(.headline)
