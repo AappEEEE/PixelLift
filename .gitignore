@@ -18,3 +18,8 @@ Payload/
 Thumbs.db
 __pycache__/
 *.pyc
+
+_verify/
+build/
+*.ipa
+
