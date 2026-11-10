@@ -427,7 +427,10 @@ enum VideoRenderer {
 
         let tw = settings.targetWidth
         let th = settings.targetHeight
-        let bitrate = max(6_000_000, Int(Double(tw * th) * 0.10))
+        // 按 0.08 bit/像素/帧 给码率：1080p60 ≈ 10Mbps，4K30 ≈ 20Mbps。
+        // 之前的写法漏乘帧率，4K 只给 6Mbps，画面会被压得很糊。
+        let bitsPerPixel = 0.08
+        let bitrate = max(8_000_000, Int(Double(tw) * Double(th) * max(1.0, settings.outFps) * bitsPerPixel))
         let videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: tw,
