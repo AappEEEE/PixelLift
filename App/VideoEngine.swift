@@ -162,18 +162,38 @@ enum SDRToHDR {
     /// 变换 Rec.709 SDR RGB8 至 HLG 编码的 Rec.2020 R′G′B′ 分量，可离线数值测试。
     static func convertLinear(_ r8: UInt8, _ g8: UInt8, _ b8: UInt8,
                               strength: Double) -> (Float, Float, Float) {
-        var r = eotf(Float(r8) / 255)
-        var g = eotf(Float(g8) / 255)
-        var b = eotf(Float(b8) / 255)
+        let r = eotfTable[Int(r8)]
+        let g = eotfTable[Int(g8)]
+        let b = eotfTable[Int(b8)]
         let y = max(0, 0.2126 * r + 0.7152 * g + 0.0722 * b)
         let amount = Float(min(1, max(0, strength)))
         let u = min(1, max(0, (y - 0.70) / 0.30))
         let knee = u * u * (3 - 2 * u)
         let mapped = y + amount * 0.30 * knee * knee
-        let gain = y > 1e-6 ? mapped / y : 1
-        r *= gain * 0.75; g *= gain * 0.75; b *= gain * 0.75
-        let (r2020, g2020, b2020) = rec709To2020(r, g, b)
-        return (hlgOETF(r2020), hlgOETF(g2020), hlgOETF(b2020))
+        let gain = (y > 1e-6 ? mapped / y : 1) * 0.75
+        let (r2020, g2020, b2020) = rec709To2020(r * gain, g * gain, b * gain)
+        return (hlgFast(r2020), hlgFast(g2020), hlgFast(b2020))
+    }
+
+    /// 256 个 8-bit 码值对应的线性光，避免逐像素做 pow。
+    static let eotfTable: [Float] = (0...255).map { eotf(Float($0) / 255.0) }
+
+    /// HLG OETF 查表（线性光 0…1.5，8192 段 + 线性插值），逐像素比 log/sqrt 快一个数量级。
+    private static let hlgTableMax: Float = 1.5
+    static let hlgTable: [Float] = {
+        let n = 8192
+        return (0...n).map { hlgOETF(hlgTableMax * Float($0) / Float(n)) }
+    }()
+
+    @inline(__always)
+    static func hlgFast(_ e: Float) -> Float {
+        let v = max(0, e)
+        guard v < hlgTableMax else { return hlgOETF(v) }
+        let n = Float(hlgTable.count - 1)
+        let pos = v / hlgTableMax * n
+        let i = Int(pos)
+        let f = pos - Float(i)
+        return hlgTable[i] * (1 - f) + hlgTable[i + 1] * f
     }
 
     /// 将 SDR RGB8 转成 HLG/Rec.2020 10-bit video-range YCbCr，写入 P010 pixel buffer。
@@ -459,6 +479,65 @@ enum FrameOps {
         }
     }
 
+    /// 抗闪烁时域融合：把上一帧结果按光流对齐到当前帧位置，再按 weight 混入当前帧。
+    /// AI 逐帧超分在不同帧之间会给出略微不同的高频细节，混合后高频抖动明显减少；
+    /// 位移过大（遮挡/切镜）的位置自动降低权重，避免拖影。
+    static func blendTemporal(prev: [UInt8], cur: [UInt8], w: Int, h: Int,
+                              flow: FlowField?, flowScale: Float, weight: Float,
+                              out: inout [UInt8]) {
+        let pixelCount = w * h
+        guard prev.count >= pixelCount * 4, cur.count >= pixelCount * 4 else { return }
+        if out.count != pixelCount * 4 { out = cur }
+
+        guard let flow, flow.w >= 8, flow.h >= 8, weight > 0 else {
+            out = cur
+            return
+        }
+        let fw = flow.w
+        let fh = flow.h
+        let base = min(1, max(0, weight))
+        let maxShift: Float = 96
+
+        prev.withUnsafeBufferPointer { pBuf in
+            cur.withUnsafeBufferPointer { cBuf in
+                out.withUnsafeMutableBufferPointer { oBuf in
+                    flow.data.withUnsafeBufferPointer { fBuf in
+                        for y in 0..<h {
+                            let fy = min(fh - 1, Int(Float(y) * Float(fh) / Float(h)))
+                            let rowBase = fy * fw
+                            for x in 0..<w {
+                                let fx = min(fw - 1, Int(Float(x) * Float(fw) / Float(w)))
+                                let fi = (rowBase + fx) * 2
+                                var vx = fBuf[fi] * flowScale
+                                var vy = fBuf[fi + 1] * flowScale
+                                let mag = (vx * vx + vy * vy).squareRoot()
+                                // 遮挡/切镜处光流不可信：位移越大权重越低。
+                                let trust = max(0, 1 - mag / maxShift)
+                                let k = base * trust
+                                let o = (y * w + x) * 4
+                                if k <= 0.001 {
+                                    oBuf[o] = cBuf[o]
+                                    oBuf[o + 1] = cBuf[o + 1]
+                                    oBuf[o + 2] = cBuf[o + 2]
+                                    oBuf[o + 3] = 255
+                                    continue
+                                }
+                                let sx = Float(x) - vx
+                                let sy = Float(y) - vy
+                                for c in 0..<3 {
+                                    let warped = sample(pBuf, w, h, sx, sy, c)
+                                    let v = Float(cBuf[o + c]) * (1 - k) + warped * k
+                                    oBuf[o + c] = UInt8(min(255, max(0, v.rounded())))
+                                }
+                                oBuf[o + 3] = 255
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// out = out * (1 - weight) + src * weight
     static func average(into out: inout [UInt8], from src: [UInt8], weight: Float) {
         let n = min(out.count, src.count)
@@ -626,6 +705,10 @@ enum VideoRenderer {
         var lastBuf: [UInt8]?
         var scratch = [UInt8](repeating: 0, count: tw * th * 4)
         var accum = [UInt8](repeating: 0, count: tw * th * 4)
+        var stable = [UInt8](repeating: 0, count: tw * th * 4)
+        var prevStable: [UInt8]?
+        // AI 逐帧超分天然会抖：只在这种模式下做时域融合，快速放大已经足够稳定。
+        let temporalWeight: Float = settings.useAI ? 0.22 : 0
 
         func writeFrame(_ buf: [UInt8]) throws {
             let pts = CMTime(seconds: Double(outIndex) / outFps, preferredTimescale: 600)
@@ -717,20 +800,36 @@ enum VideoRenderer {
 
             if let prev = prevBuf, prev.count == buf.count {
                 let needsInterp = perPair > 1 || blurSamples > 1
-                let flow: FlowField? = needsInterp && prevCG != nil
+                let needsFlow = needsInterp || temporalWeight > 0
+                let flow: FlowField? = needsFlow && prevCG != nil
                     ? FrameOps.flow(from: prevCG!, to: cg)
                     : nil
                 let flowScale: Float = flow.map { Float(tw) / Float($0.w) } ?? 1
+
+                // 当前帧先做时域融合，再和上一帧合成中间帧；两端都用稳定后的结果，时间轴不乱。
+                var outBuf = buf
+                if temporalWeight > 0, let prevStable {
+                    FrameOps.blendTemporal(prev: prevStable, cur: buf, w: tw, h: th,
+                                           flow: flow, flowScale: flowScale,
+                                           weight: temporalWeight, out: &stable)
+                    outBuf = stable
+                }
+                let aBuf = prevStable ?? prev
+
                 for j in 0..<perPair {
                     let t = Float(j) / Float(perPair)
-                    try emit(prev, buf, t: t, flow: flow, flowScale: flowScale)
+                    try emit(aBuf, outBuf, t: t, flow: flow, flowScale: flowScale)
                     if control.cancelled { break }
                 }
+                prevStable = outBuf
+                lastBuf = outBuf
+            } else if temporalWeight > 0 {
+                prevStable = buf
             }
 
             prevBuf = buf
             prevCG = cg
-            lastBuf = buf
+            if lastBuf == nil { lastBuf = buf }
 
             if control.cancelled {
                 cancelled = true
