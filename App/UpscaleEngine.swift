@@ -271,6 +271,10 @@ final class UpscaleEngine: ObservableObject {
     @Published var modelState = "检测中…"
     @Published var notice: String?
     @Published var overallProgress: Double = 0
+    /// 图片侧的细节锐度（与视频 M7 同一套亮度域保边锐化，默认比视频低一档，照片本身高频更密）。
+    @Published var detail: Double = 0.20
+    /// 图片侧降噪：只压小幅度残差，用来吃掉手机照片的暗部噪点。
+    @Published var denoise: Double = 0.12
 
     private var models: [ModelKind: MLModel] = [:]
     private var control: RunControl?
@@ -522,7 +526,8 @@ final class UpscaleEngine: ObservableObject {
             return false
         }
 
-        let finalCG = Self.resampled(aiCG, width: p.targetWidth, height: p.targetHeight) ?? aiCG
+        let resizedCG = Self.resampled(aiCG, width: p.targetWidth, height: p.targetHeight) ?? aiCG
+        let finalCG = Self.detailPass(resizedCG, detail: detail, denoise: denoise) ?? resizedCG
         guard let url = Self.write(finalCG, format: format,
                                    name: item.name, index: idx + 1) else {
             items[idx].message = "写文件失败"
@@ -654,8 +659,32 @@ final class UpscaleEngine: ObservableObject {
         return resampled(cg, width: nw, height: nh)
     }
 
-    static func resampled(_ cg: CGImage, width: Int, height: Int) -> CGImage? {
-        if width == cg.width && height == cg.height { return cg }
+    /// 细节/降噪：与视频侧共用 QualityCore（亮度域保边锐化 + 软门限降噪 + 8-bit 抖动）。
+    /// 纯 Swift 实现，照片尺寸通常 8–24MP，单张几十到两百毫秒，用户感知不到。
+    static func detailPass(_ cg: CGImage, detail: Double, denoise: Double) -> CGImage? {
+        if detail <= 0.001 && denoise <= 0.001 { return cg }
+        let w = cg.width
+        let h = cg.height
+        if w < 8 || h < 8 { return cg }
+        let space = CGColorSpaceCreateDeviceRGB()
+        guard let ctx = CGContext(data: nil, width: w, height: h,
+                                  bitsPerComponent: 8, bytesPerRow: w * 4,
+                                  space: space,
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.interpolationQuality = .none
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        guard let base = ctx.data else { return nil }
+        let count = w * h * 4
+        var buf = [UInt8](repeating: 0, count: count)
+        buf.withUnsafeMutableBytes { raw in
+            if let dst = raw.baseAddress { memcpy(dst, base, count) }
+        }
+        QualityCore.applyDetail(&buf, width: w, height: h,
+                                amount: Float(detail), denoise: Float(denoise), dither: true)
+        return makeCGImage(from: buf, width: w, height: h)
+    }
+
+    static func resampled(_ cg: CGImage, width: Int, height: Int) -> CGImage? {        if width == cg.width && height == cg.height { return cg }
         let space = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: nil, width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: width * 4,

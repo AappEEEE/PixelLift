@@ -67,3 +67,4 @@ project.yml      XcodeGen 工程描述
 ```
 
 - M6/M7 细化文档：[docs/M6-M7-画质打磨.md](docs/M6-M7-画质打磨.md)
+- 图片侧也接了同一套细节/降噪（QualityCore.applyDetail），默认锐度 20% / 降噪 12%。

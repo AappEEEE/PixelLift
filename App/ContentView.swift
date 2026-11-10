@@ -37,6 +37,7 @@ struct ContentView: View {
                     if !engine.items.isEmpty { listCard }
                     scaleCard
                     modelCard
+                    qualityCard
                     actionCard
                     if let notice = engine.notice {
                         Text(notice)
@@ -347,6 +348,39 @@ struct ContentView: View {
         }
         .padding()
         .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - 细节与降噪
+
+    private var qualityCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Label("细节与降噪", systemImage: "wand.and.rays")
+                .font(.subheadline.weight(.semibold))
+            HStack {
+                Text("锐度")
+                    .font(.caption)
+                Slider(value: $engine.detail, in: 0...1, step: 0.05)
+                Text("\(Int(engine.detail * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+            }
+            HStack {
+                Text("降噪")
+                    .font(.caption)
+                Slider(value: $engine.denoise, in: 0...1, step: 0.05)
+                Text("\(Int(engine.denoise * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+            }
+            Text("和视频用同一套算法：在亮度域锐化并把输出钳在源局部极值内，所以不会出白边光晕；降噪只压小幅度残差，边缘不动。锐度 0 / 降噪 0 就是纯模型输出。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        .disabled(engine.isRunning)
     }
 
     // MARK: - 操作
