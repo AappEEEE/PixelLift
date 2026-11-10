@@ -21,6 +21,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify SDR-to-HLG transfer math
+        run: python scripts/verify_hdr_math.py
+
       - name: Cache converted models
         id: model-cache
         uses: actions/cache@v4
@@ -96,17 +99,24 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
-          name: PixelLift v0.1.${{ github.run_number }} · 图片超分 + 视频补帧（M3）
+          name: PixelLift v0.1.${{ github.run_number }} · 视频 SDR→HDR HLG + 图片/视频增强
           make_latest: true
           files: |
             PixelLift.ipa
             PixelLift.ipa.sha256
           fail_on_unmatched_files: true
           body: |
-            **PixelLift** 是 iOS 上的本地视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
+            **PixelLift** 是 iOS 上的本地图片/视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
             图片和视频在一个 App 里，处理全在本机，不上传、不订阅。
 
-            ### 本版新增：补帧 / 慢动作 / 动态模糊（M3）
+            ### 本版新增：SDR→HDR（HLG / 10-bit）
+            - 逐像素处理：Rec.709 SDR → 线性光 → 可调高光肩部 → Rec.2020 → BT.2100 HLG → P010 10-bit HEVC
+            - 写入 Rec.2020 primaries/matrix 与 HLG transfer metadata；关闭时保留 Rec.709 SDR 输出
+            - SDR 白映射至 HLG reference white；输入已经裁掉的高光纹理不会凭空恢复
+            - 开 HDR 时输出最高约 1080p/2.1MP；必须使用支持 HLG 的设备/播放器验收观感
+            - 数学探针与 CI 编译通过不等于真机 HDR 质量验收；本版尚无 HDR 屏幕实测
+
+            ### 已有：补帧 / 慢动作 / 动态模糊（M3）
             - **光流补帧** ×2 / ×4：Vision `VNGenerateOpticalFlowRequest` 求逐像素位移，
               双向 warp 后按相位融合，30fps 变 60/120fps
             - **慢动作** 0.5× / 0.25×：时间轴拉长，多出来的采样点全部由光流合成
@@ -135,6 +145,6 @@ jobs:
             ### 已知取舍
             - AI 逐帧超分按帧计时，10 秒 30fps 的片子要几分钟，处理时保持前台
             - 补帧走光流，大面积遮挡 / 闪烁 / 快速横移处可能有轻微拖影
-            - 慢动作不带音轨；SDR→HDR 仍在路线图（v0.5）
+            - 慢动作不带音轨；HDR 效果受 SDR 源素材和显示设备限制
             - 视频输出统一重编码为 HEVC，不做逐帧元数据保留
 

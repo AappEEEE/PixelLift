@@ -42,6 +42,7 @@ struct VideoView: View {
                         modeCard
                         scaleCard(clip)
                         motionCard(clip)
+                        hdrCard
                         actionCard(clip)
                     }
                     if let notice = engine.notice {
@@ -257,6 +258,38 @@ struct VideoView: View {
         .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
     }
 
+    private var hdrCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Label("SDR → HDR", systemImage: "sun.max.fill")
+                    .font(.headline)
+                Spacer()
+                Toggle("HLG", isOn: $engine.hdrEnabled)
+                    .labelsHidden()
+                    .disabled(engine.isRunning)
+            }
+            Text("将 SDR 映射为 HLG / BT.2020 10-bit HEVC；不只是写 HDR 标签。SDR 白映射到 HLG 参考白，保留色调并做可调高光肩部。")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if engine.hdrEnabled {
+                HStack {
+                    Text("高光扩展")
+                    Slider(value: $engine.hdrIntensity, in: 0...1, step: 0.05)
+                        .disabled(engine.isRunning)
+                    Text("\(Int(engine.hdrIntensity * 100))%")
+                        .monospacedDigit()
+                        .frame(width: 44, alignment: .trailing)
+                }
+                Text("强度只扩展输入里已有的亮度层次；SDR 已经裁白的细节无法凭空恢复。导出后请在支持 HDR/HLG 的屏幕与播放器中检查。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(16)
+        .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 16))
+        .disabled(engine.isRunning)
+    }
+
     private func actionCard(_ clip: VideoClip) -> some View {
         VStack(spacing: 12) {
             if engine.isRunning {
@@ -331,7 +364,7 @@ struct VideoView: View {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "-"
         let build = info["CFBundleVersion"] as? String ?? "-"
-        return Text("v\(version) (build \(build)) · 视频 M3 补帧版")
+        return Text("v\(version) (build \(build)) · 视频 HDR HLG 版")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity)
@@ -354,8 +387,12 @@ struct VideoView: View {
                     Text("· 补帧：用 Vision 的光流算出每个像素的运动方向，在相邻两帧之间合成中间帧，所以 ×2 就是把 30fps 变成 60fps，运动更顺；\n· 慢动作：把时间轴拉长，多出来的每一帧同样是光流补出来的，(补帧 ×2 + 慢动作 0.5×) 一秒钟要补 4 帧；\n· 动态模糊：把同一时刻前后几个补帧采样叠起来，模拟快门拖影；\n· 慢动作会改变时长，所以这一单不带原音轨；只补帧不改时长时音频照原样透传。")
                         .font(.footnote)
 
+                    Text("SDR → HDR (HLG)").font(.headline)
+                    Text("· 打开后输出 HEVC Main10 / P010 10-bit、Rec.2020 色域和 BT.2100 HLG 传递函数；滑杆控制高光肩部强度，不会凭空恢复输入 SDR 已裁掉的高光纹理；\n· SDR 白映射到 HLG 参考白，观感取决于源片、播放器的色彩管理与显示器峰值亮度；请用支持 HLG 的设备核对；\n· 为降低 P010 编码开销，HDR 模式最高约 1080p / 2.1MP。当前没有在真机和 HDR 显示器做主观画质验收。")
+                        .font(.footnote)
+
                     Text("本版限制").font(.headline)
-                    Text("· 输出上限 4K / 830 万像素；开了补帧或慢动作会降到 1080p 级，动态模糊再降一档，否则一帧要几百毫秒；\n· 补帧靠光流，画面里出现大面积遮挡、闪烁或快速横移时可能有轻微拖影；\n· 处理时要保持 App 在前台，iOS 不允许后台长时间算。")
+                    Text("· SDR 输出上限 4K / 830 万像素；开了补帧或慢动作会降到 1080p 级，动态模糊再降一档；\n· 补帧靠光流，画面里出现大面积遮挡、闪烁或快速横移时可能有轻微拖影；\n· 处理时要保持 App 在前台，iOS 不允许后台长时间算。")
                         .font(.footnote)
 
                     Text("编码").font(.headline)

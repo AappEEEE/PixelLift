@@ -6,6 +6,7 @@ import Photos
 import UIKit
 import UniformTypeIdentifiers
 import Vision
+import VideoToolbox
 
 // MARK: - 数据模型
 
@@ -120,12 +121,125 @@ struct VideoSettings: Sendable {
     var blurSamples: Int
     var keepAudio: Bool
     var expectedFrames: Int
+    var hdrEnabled: Bool
+    var hdrIntensity: Double
 }
 
 /// MLModel 不是 Sendable，用盒子跨线程传
 final class ModelBox: @unchecked Sendable {
     let model: MLModel?
     init(_ model: MLModel?) { self.model = model }
+}
+
+/// 输出 BT.2100 HLG / BT.2020 的 10-bit HEVC 视频。映射在编码前的线性光 RGB 上完成。
+enum SDRToHDR {
+    /// IEC 61966-2-1 sRGB / BT.709 OETF 逆变换（视频帧经 CGColorSpace.sRGB 解码后仍是 gamma 编码值）。
+    @inline(__always)
+    static func eotf(_ x: Float) -> Float {
+        let v = max(0, x)
+        return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+
+    /// HLG OETF（BT.2100）。线性场景值 -> HLG 非线性编码值。
+    @inline(__always)
+    static func hlgOETF(_ e: Float) -> Float {
+        let a: Float = 0.17883277
+        let b: Float = 0.28466892
+        let c: Float = 0.55991073
+        let v = max(0, e)
+        return v <= 1.0 / 12.0 ? sqrt(3 * v) : a * log(12 * v - b) + c
+    }
+
+    /// Rec.709 primaries -> Rec.2020 primaries，输入输出均为线性 RGB。
+    @inline(__always)
+    static func rec709To2020(_ r: Float, _ g: Float, _ b: Float) -> (Float, Float, Float) {
+        let rr = 0.627404 * r + 0.329283 * g + 0.043313 * b
+        let gg = 0.069097 * r + 0.919540 * g + 0.011362 * b
+        let bb = 0.016391 * r + 0.088013 * g + 0.895595 * b
+        return (rr, gg, bb)
+    }
+
+    /// 变换 Rec.709 SDR RGB8 至 HLG 编码的 Rec.2020 R′G′B′ 分量，可离线数值测试。
+    static func convertLinear(_ r8: UInt8, _ g8: UInt8, _ b8: UInt8,
+                              strength: Double) -> (Float, Float, Float) {
+        var r = eotf(Float(r8) / 255)
+        var g = eotf(Float(g8) / 255)
+        var b = eotf(Float(b8) / 255)
+        let y = max(0, 0.2126 * r + 0.7152 * g + 0.0722 * b)
+        let amount = Float(min(1, max(0, strength)))
+        let u = min(1, max(0, (y - 0.70) / 0.30))
+        let knee = u * u * (3 - 2 * u)
+        let mapped = y + amount * 0.30 * knee * knee
+        let gain = y > 1e-6 ? mapped / y : 1
+        r *= gain * 0.75; g *= gain * 0.75; b *= gain * 0.75
+        let (r2020, g2020, b2020) = rec709To2020(r, g, b)
+        return (hlgOETF(r2020), hlgOETF(g2020), hlgOETF(b2020))
+    }
+
+    /// 将 SDR RGB8 转成 HLG/Rec.2020 10-bit video-range YCbCr，写入 P010 pixel buffer。
+    /// P010 存储为 10-bit 左对齐 16-bit words；Y 范围 64…940，Cb/Cr 64…960。
+    static func writeP010(_ rgba: [UInt8], width: Int, height: Int,
+                          strength: Double, into pixelBuffer: CVPixelBuffer) -> Bool {
+        guard width > 0, height > 0, width % 2 == 0, height % 2 == 0,
+              CVPixelBufferGetPixelFormatType(pixelBuffer) == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+              CVPixelBufferGetWidth(pixelBuffer) == width,
+              CVPixelBufferGetHeight(pixelBuffer) == height,
+              rgba.count >= width * height * 4,
+              CVPixelBufferLockBaseAddress(pixelBuffer, []) == kCVReturnSuccess else { return false }
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) == 2,
+              let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let uvBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else { return false }
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0) / MemoryLayout<UInt16>.stride
+        let uvStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1) / MemoryLayout<UInt16>.stride
+        guard yStride >= width, uvStride >= width,
+              CVPixelBufferGetHeightOfPlane(pixelBuffer, 0) >= height,
+              CVPixelBufferGetHeightOfPlane(pixelBuffer, 1) >= height / 2 else { return false }
+        let yPlane = yBase.assumingMemoryBound(to: UInt16.self)
+        let uvPlane = uvBase.assumingMemoryBound(to: UInt16.self)
+        let dither: (Int, Int) -> Float = { x, y in
+            // 固定 4×4 Bayer pattern，幅度约 0.5 个 10-bit code，降低量化色带而不引入时域闪烁。
+            let matrix: [Float] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+            return (matrix[(y & 3) * 4 + (x & 3)] / 16.0 - 0.5) / 876.0
+        }
+        @inline(__always) func clamp(_ value: Float, _ low: Float, _ high: Float) -> UInt16 {
+            UInt16(min(high, max(low, value)).rounded()) << 6
+        }
+        @inline(__always) func rgb2020(_ x: Int, _ y: Int) -> (Float, Float, Float) {
+            let i = (y * width + x) * 4
+            return SDRToHDR.convertLinear(rgba[i], rgba[i + 1], rgba[i + 2], strength: strength)
+        }
+        @inline(__always) func chroma(_ value: Float, _ limit: Float) -> Float {
+            min(limit, max(-limit, value))
+        }
+        for y in 0..<height {
+            for x in 0..<width {
+                let (rPrime, gPrime, bPrime) = rgb2020(x, y)
+                let yPrime = 0.2627 * rPrime + 0.6780 * gPrime + 0.0593 * bPrime
+                yPlane[y * yStride + x] = clamp(64 + 876 * yPrime + dither(x, y) * 876, 64, 940)
+            }
+        }
+        for y in stride(from: 0, to: height, by: 2) {
+            for x in stride(from: 0, to: width, by: 2) {
+                var cb: Float = 0
+                var cr: Float = 0
+                for dy in 0..<2 {
+                    for dx in 0..<2 {
+                        let (rPrime, gPrime, bPrime) = rgb2020(x + dx, y + dy)
+                        let yPrime = 0.2627 * rPrime + 0.6780 * gPrime + 0.0593 * bPrime
+                        cb += chroma((bPrime - yPrime) / (2 * (1 - 0.0593)), 0.5)
+                        cr += chroma((rPrime - yPrime) / (2 * (1 - 0.2627)), 0.5)
+                    }
+                }
+                let chromaOffset = (y / 2) * uvStride + x
+                let u = 512 + 896 * (cb / 4)
+                let v = 512 + 896 * (cr / 4)
+                uvPlane[chromaOffset] = clamp(u, 64, 960)
+                uvPlane[chromaOffset + 1] = clamp(v, 64, 960)
+            }
+        }
+        return true
+    }
 }
 
 enum VideoRenderError: LocalizedError {
@@ -429,26 +543,47 @@ enum VideoRenderer {
         let th = settings.targetHeight
         // 按 0.08 bit/像素/帧 给码率：1080p60 ≈ 10Mbps，4K30 ≈ 20Mbps。
         // 之前的写法漏乘帧率，4K 只给 6Mbps，画面会被压得很糊。
-        let bitsPerPixel = 0.08
+        let bitsPerPixel = settings.hdrEnabled ? 0.12 : 0.08
         let bitrate = max(8_000_000, Int(Double(tw) * Double(th) * max(1.0, settings.outFps) * bitsPerPixel))
-        let videoSettings: [String: Any] = [
+        var compression: [String: Any] = [
+            AVVideoAverageBitRateKey: bitrate,
+            AVVideoMaxKeyFrameIntervalKey: 60,
+            AVVideoExpectedSourceFrameRateKey: max(1, Int(settings.outFps.rounded()))
+        ]
+        if settings.hdrEnabled {
+            // P010 输入本身会驱动 Main10；显式写上让编码器别退回 8-bit profile。
+            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+        }
+        var videoSettings: [String: Any] = [
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: tw,
             AVVideoHeightKey: th,
-            AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: bitrate,
-                AVVideoMaxKeyFrameIntervalKey: 60,
-                AVVideoExpectedSourceFrameRateKey: max(1, Int(settings.outFps.rounded()))
-            ]
+            AVVideoCompressionPropertiesKey: compression
         ]
+        let pixelFormat = settings.hdrEnabled ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_32BGRA
+        if settings.hdrEnabled {
+            videoSettings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+            ]
+            videoSettings[AVVideoAllowWideColorKey] = true
+        } else {
+            videoSettings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+            ]
+        }
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoIn.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoIn,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
                 kCVPixelBufferWidthKey as String: tw,
-                kCVPixelBufferHeightKey as String: th
+                kCVPixelBufferHeightKey as String: th,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
         )
         guard writer.canAdd(videoIn) else { throw VideoRenderError.writerSetup }
@@ -505,9 +640,16 @@ enum VideoRenderer {
             guard status == kCVReturnSuccess, let pixelBuffer = maybeBuffer else {
                 throw VideoRenderError.pixelBuffer
             }
-            guard let image = Pix.cgImage(rgba: buf, width: tw, height: th),
-                  Pix.draw(image, into: pixelBuffer) else {
-                throw VideoRenderError.pixelBuffer
+            if settings.hdrEnabled {
+                guard SDRToHDR.writeP010(buf, width: tw, height: th,
+                                         strength: settings.hdrIntensity, into: pixelBuffer) else {
+                    throw VideoRenderError.pixelBuffer
+                }
+            } else {
+                guard let image = Pix.cgImage(rgba: buf, width: tw, height: th),
+                      Pix.draw(image, into: pixelBuffer) else {
+                    throw VideoRenderError.pixelBuffer
+                }
             }
             guard adaptor.append(pixelBuffer, withPresentationTime: pts) else {
                 throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "帧写入失败")
@@ -676,6 +818,8 @@ final class VideoEngine: ObservableObject {
     @Published var interp: InterpMode = .off
     @Published var slow: SlowMode = .normal
     @Published var blur: BlurMode = .off
+    @Published var hdrEnabled = false
+    @Published var hdrIntensity: Double = 0.65
     @Published var isRunning = false
     @Published var isPaused = false
     @Published var progress: Double = 0
@@ -812,6 +956,22 @@ final class VideoEngine: ObservableObject {
             notes.append("已限制到 \(tw)×\(th)")
         }
 
+        if hdrEnabled {
+            capEdge = min(capEdge, 1920)
+            capPix = min(capPix, 2_100_000)
+            notes.append("HLG/BT.2020 10-bit 输出，设备编码兼容性以真机验证为准")
+        }
+
+        if hdrEnabled {
+            let evenW = tw - tw % 2
+            let evenH = th - th % 2
+            if evenW != tw || evenH != th {
+                tw = max(2, evenW)
+                th = max(2, evenH)
+                notes.append("为 P010 色度采样将尺寸调整为偶数：\(tw)×\(th)")
+            }
+        }
+
         var aiEdge = min(1280, max(384, Int((Double(max(tw, th)) / 4.0).rounded())))
         if aiEdge > max(w0, h0) { aiEdge = max(w0, h0) }
 
@@ -858,7 +1018,9 @@ final class VideoEngine: ObservableObject {
                                      samplesPerPair: p.samplesPerPair,
                                      blurSamples: blur.samples,
                                      keepAudio: p.keepAudio,
-                                     expectedFrames: p.frames)
+                                     expectedFrames: p.frames,
+                                      hdrEnabled: hdrEnabled,
+                                      hdrIntensity: hdrIntensity)
         let dest = FileManager.default.temporaryDirectory
             .appendingPathComponent("PixelLift-video-\(Int(Date().timeIntervalSince1970)).mp4")
         let box = ModelBox(models[modelKind] ?? models[.photo])
@@ -942,6 +1104,7 @@ final class VideoEngine: ObservableObject {
         if interp != .off { parts.append("补帧 \(interp.title)") }
         if slow != .normal { parts.append("慢动作 \(slow.title)") }
         if blur != .off { parts.append("动态模糊 \(blur.title)") }
+        if hdrEnabled { parts.append("SDR→HLG \(Int(hdrIntensity * 100))%") }
         return parts.joined(separator: " + ")
     }
 
