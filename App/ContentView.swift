@@ -1,35 +1,43 @@
 import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
+@MainActor
 struct ContentView: View {
     @StateObject private var engine = UpscaleEngine()
-    @State private var picker: PhotosPickerItem?
+
+    @State private var pickedPhotos: [PhotosPickerItem] = []
+    @State private var showFileImporter = false
+    @State private var showHelp = false
+    @State private var importing = false
+
     @State private var scale: Double = 2
+    @State private var useCustomWidth = false
     @State private var customWidth: String = ""
     @State private var format: ExportFormat = .png
     @State private var kind: ModelKind = .photo
-    @State private var showHelp = false
 
     private let presets: [Double] = [1.5, 2, 2.5, 3, 4, 6, 8]
 
     private var customValue: Int? {
+        guard useCustomWidth else { return nil }
         let t = customWidth.trimmingCharacters(in: .whitespaces)
         guard let v = Int(t), v >= 16 else { return nil }
         return v
     }
 
-    private var plan: UpscaleEngine.Plan {
-        engine.plan(scale: scale, customWidth: customValue)
-    }
+    private var pendingCount: Int { engine.items.filter { $0.state != .done }.count }
+    private var doneCount: Int { engine.items.filter { $0.state == .done }.count }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-                    previewCard
+                    importCard
+                    if !engine.items.isEmpty { listCard }
                     scaleCard
-                    outputCard
-                    actionBar
+                    modelCard
+                    actionCard
                     if let notice = engine.notice {
                         Text(notice)
                             .font(.footnote)
@@ -39,6 +47,7 @@ struct ContentView: View {
                     }
                 }
                 .padding()
+                .padding(.bottom, 24)
             }
             .navigationTitle("PixelLift")
             .navigationBarTitleDisplayMode(.inline)
@@ -46,198 +55,373 @@ struct ContentView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showHelp = true } label: { Image(systemName: "questionmark.circle") }
                 }
-            }
-            .sheet(isPresented: $showHelp) { helpSheet }
-            .onChange(of: picker) { _, item in
-                guard let item else { return }
-                Task {
-                    if let data = try? await item.loadTransferable(type: Data.self) {
-                        await engine.load(data: data)
+                if !engine.items.isEmpty {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(role: .destructive) { engine.removeAll() } label: {
+                            Image(systemName: "trash")
+                        }
+                        .disabled(engine.isRunning)
                     }
                 }
             }
-            .onChange(of: kind) { _, _ in engine.notice = engine.modelState }
+            .sheet(isPresented: $showHelp) { helpSheet }
+            .fileImporter(isPresented: $showFileImporter,
+                          allowedContentTypes: [.image],
+                          allowsMultipleSelection: true) { result in
+                handleFileImport(result)
+            }
+            .onChange(of: pickedPhotos) { _, newItems in
+                guard !newItems.isEmpty else { return }
+                importing = true
+                Task {
+                    var idx = engine.items.count
+                    for item in newItems {
+                        idx += 1
+                        if let data = try? await item.loadTransferable(type: Data.self) {
+                            engine.add(data: data, name: "相册 \(idx)", fallbackIndex: idx)
+                        }
+                    }
+                    pickedPhotos = []
+                    importing = false
+                }
+            }
         }
     }
 
-    // MARK: - 预览
+    // MARK: - 导入
 
-    private var previewCard: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Text("原图").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Text(engine.inputSizeLabel).font(.caption).monospacedDigit()
+    private var importCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                PhotosPicker(selection: $pickedPhotos,
+                             maxSelectionCount: 20,
+                             selectionBehavior: .ordered,
+                             matching: .images,
+                             photoLibrary: .shared()) {
+                    Label("从相册选", systemImage: "photo.on.rectangle.angled")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(engine.isRunning)
+
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Label("从文件导入", systemImage: "folder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(engine.isRunning)
             }
-            ZStack {
-                RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemBackground))
-                if let img = engine.outputPreview ?? engine.inputPreview {
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFit()
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else {
-                    VStack(spacing: 8) {
-                        Image(systemName: "photo.badge.plus").font(.largeTitle)
-                        Text("选择一张图片").font(.footnote)
-                    }
-                    .foregroundStyle(.secondary)
-                    .padding(40)
+            .controlSize(.large)
+
+            HStack {
+                Text(engine.status)
+                Spacer()
+                if importing {
+                    ProgressView().controlSize(.small)
                 }
             }
-            .frame(minHeight: 200)
+            .font(.footnote)
+            .foregroundStyle(.secondary)
 
-            PhotosPicker(selection: $picker, matching: .images, photoLibrary: .shared()) {
-                Label("从相册选择", systemImage: "photo.on.rectangle")
-                    .frame(maxWidth: .infinity)
+            Text("支持多选，一次处理一批。相册一次最多 20 张，「文件」不限。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - 列表
+
+    private var listCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("队列 \(engine.items.count) 张")
+                    .font(.subheadline.weight(.semibold))
+                Spacer()
+                if doneCount > 0 {
+                    Text("完成 \(doneCount)")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
             }
-            .buttonStyle(.bordered)
+
+            if engine.isRunning {
+                ProgressView(value: engine.overallProgress)
+                    .tint(.accentColor)
+            }
+
+            ForEach(engine.items) { item in
+                itemRow(item)
+                if item.id != engine.items.last?.id {
+                    Divider()
+                }
+            }
+        }
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func itemRow(_ item: WorkItem) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack(alignment: .bottomTrailing) {
+                Image(uiImage: (item.state == .done ? (item.resultThumb ?? item.thumb) : item.thumb))
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 56, height: 56)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                if item.state == .done {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .background(Circle().fill(.white))
+                        .offset(x: 3, y: 3)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.name)
+                    .font(.subheadline)
+                    .lineLimit(1)
+                Text(item.sourceLabel + (item.outputLabel.isEmpty ? "" : "  →  " + item.outputLabel))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+
+                if item.state == .running {
+                    ProgressView(value: item.progress)
+                        .controlSize(.small)
+                } else {
+                    HStack(spacing: 8) {
+                        Text(item.state.label)
+                            .font(.caption2)
+                            .foregroundStyle(color(for: item.state))
+                        if let msg = item.message, item.state != .done {
+                            Text(msg)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            if item.state == .done, let url = item.outputURL {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { await engine.saveToPhotos(id: item.id) }
+                    } label: {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    ShareLink(item: url) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+                .buttonStyle(.borderless)
+                .font(.body)
+            } else if !engine.isRunning {
+                Button {
+                    engine.remove(id: item.id)
+                } label: {
+                    Image(systemName: "xmark.circle")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    private func color(for state: ItemState) -> Color {
+        switch state {
+        case .done: return .green
+        case .failed: return .red
+        case .running: return .accentColor
+        case .pending, .cancelled: return .secondary
         }
     }
 
     // MARK: - 倍率
 
     private var scaleCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("放大倍率").font(.subheadline.weight(.semibold))
-                Spacer()
-                Text(customValue == nil ? String(format: "%.1f×", scale) : "自定义宽度")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+        VStack(alignment: .leading, spacing: 12) {
+            Text("输出尺寸")
+                .font(.subheadline.weight(.semibold))
 
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 4), spacing: 8) {
                 ForEach(presets, id: \.self) { p in
                     Button {
                         scale = p
-                        customWidth = ""
+                        useCustomWidth = false
                     } label: {
-                        VStack(spacing: 2) {
-                            Text(p == floor(p) ? "\(Int(p))×" : String(format: "%.1f×", p))
-                                .font(.callout.weight(.medium))
-                                .monospacedDigit()
-                            Text(p == 4 ? "AI 原生" : (p > 4 ? "AI+放大" : "AI+缩回"))
-                                .font(.system(size: 9))
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: 9)
-                                .fill(customValue == nil && scale == p ? Color.accentColor.opacity(0.18) : Color(.tertiarySystemFill))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 9)
-                                .stroke(customValue == nil && scale == p ? Color.accentColor : .clear, lineWidth: 1.2)
-                        )
+                        Text(p == floor(p) ? "\(Int(p))×" : String(format: "%.1f×", p))
+                            .font(.subheadline.weight(.medium))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 9)
+                            .background(selectedBackground(isOn: scale == p && !useCustomWidth))
                     }
                     .buttonStyle(.plain)
+                    .disabled(engine.isRunning)
+                }
+                Button {
+                    useCustomWidth = true
+                } label: {
+                    Text("自定宽")
+                        .font(.subheadline.weight(.medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 9)
+                        .background(selectedBackground(isOn: useCustomWidth))
+                }
+                .buttonStyle(.plain)
+                .disabled(engine.isRunning)
+            }
+
+            if useCustomWidth {
+                HStack(spacing: 8) {
+                    TextField("目标宽度，如 3000", text: $customWidth)
+                        .keyboardType(.numberPad)
+                        .textFieldStyle(.roundedBorder)
+                    Text("px").font(.footnote).foregroundStyle(.secondary)
                 }
             }
 
-            HStack(spacing: 8) {
-                TextField("自定义宽度（px）", text: $customWidth)
-                    .keyboardType(.numberPad)
-                    .textFieldStyle(.roundedBorder)
-                if customValue != nil {
-                    Button("清除") { customWidth = "" }
-                        .font(.footnote)
-                }
-            }
-
-            Text("模型原生为 4× 重建；其它倍率在 4× 结果上做 Lanczos 缩放，倍率越低越接近「AI 去噪后再缩回」。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-
-            if plan.targetWidth > 0 {
-                Text("输出：\(plan.targetWidth) × \(plan.targetHeight) px")
-                    .font(.footnote.monospacedDigit())
+            if let first = engine.items.first {
+                let p = engine.plan(for: first.source, scale: scale, customWidth: customValue)
+                Text("首张：\(first.sourceLabel) → \(p.targetWidth) × \(p.targetHeight)"
+                     + (p.note.map { "（\($0)）" } ?? ""))
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
-            Picker("模型", selection: $kind) {
-                ForEach(ModelKind.allCases) { k in Text(k.title).tag(k) }
-            }
-            .pickerStyle(.segmented)
-
-            Picker("格式", selection: $format) {
-                ForEach(ExportFormat.allCases) { f in Text(f.title).tag(f) }
-            }
-            .pickerStyle(.segmented)
-
-            Text(engine.modelState).font(.caption2).foregroundStyle(.secondary)
+            Text("原生 AI 为 4×。1.5–3× 是 4× 重建后缩回，6×/8× 是重建后再放大。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemBackground)))
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
-    // MARK: - 输出信息
+    private func selectedBackground(isOn: Bool) -> some View {
+        RoundedRectangle(cornerRadius: 10)
+            .fill(isOn ? Color.accentColor.opacity(0.22) : Color.primary.opacity(0.06))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isOn ? Color.accentColor : Color.clear, lineWidth: 1.5)
+            )
+    }
 
-    private var outputCard: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text(engine.status).font(.footnote)
-                Spacer()
-                if engine.isRunning {
-                    Text("\(Int(engine.progress * 100))%")
-                        .font(.footnote.monospacedDigit())
-                        .foregroundStyle(.secondary)
+    // MARK: - 模型与格式
+
+    private var modelCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("模型")
+                .font(.subheadline.weight(.semibold))
+            Picker("模型", selection: $kind) {
+                ForEach(ModelKind.allCases) { k in
+                    Text(k.title).tag(k)
                 }
             }
-            if engine.isRunning || engine.progress > 0 {
-                ProgressView(value: engine.progress)
-            }
-            if let url = engine.outputURL {
-                HStack(spacing: 12) {
-                    Button {
-                        Task { await engine.saveToPhotos() }
-                    } label: {
-                        Label("存入相册", systemImage: "square.and.arrow.down")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    ShareLink(item: url) {
-                        Label("分享/存文件", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(.bordered)
+            .pickerStyle(.segmented)
+            .disabled(engine.isRunning)
+
+            Text("格式")
+                .font(.subheadline.weight(.semibold))
+            Picker("格式", selection: $format) {
+                ForEach(ExportFormat.allCases) { f in
+                    Text(f.title).tag(f)
                 }
-                .font(.footnote)
             }
+            .pickerStyle(.segmented)
+            .disabled(engine.isRunning)
+
+            Text(engine.modelState)
+                .font(.caption2)
+                .foregroundStyle(engine.modelState.hasPrefix("⚠️") ? .orange : .secondary)
         }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(.secondarySystemBackground)))
+        .padding()
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
     // MARK: - 操作
 
-    private var actionBar: some View {
-        HStack(spacing: 10) {
+    private var actionCard: some View {
+        VStack(spacing: 10) {
             if engine.isRunning {
-                if engine.isPaused {
-                    Button { engine.resume() } label: {
-                        Label("继续", systemImage: "play.fill").frame(maxWidth: .infinity)
+                HStack(spacing: 10) {
+                    Button {
+                        if engine.isPaused {
+                            engine.resume()
+                        } else {
+                            engine.pause()
+                        }
+                    } label: {
+                        Label(engine.isPaused ? "继续" : "暂停",
+                              systemImage: engine.isPaused ? "play.fill" : "pause.fill")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
-                } else {
-                    Button { engine.pause() } label: {
-                        Label("暂停", systemImage: "pause.fill").frame(maxWidth: .infinity)
+                    .controlSize(.large)
+
+                    Button(role: .destructive) {
+                        engine.cancel()
+                    } label: {
+                        Label("取消", systemImage: "xmark")
+                            .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
+                    .controlSize(.large)
                 }
-                Button(role: .destructive) { engine.cancel() } label: {
-                    Label("取消", systemImage: "xmark").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
             } else {
                 Button {
-                    engine.start(scale: scale, customWidth: customValue, format: format, kind: kind)
+                    engine.start(scale: scale, customWidth: customValue,
+                                 format: format, kind: kind)
                 } label: {
-                    Label("开始超分", systemImage: "wand.and.stars").frame(maxWidth: .infinity)
+                    Label(pendingCount > 0 ? "开始处理 \(pendingCount) 张" : "开始处理",
+                          systemImage: "wand.and.stars")
+                        .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(engine.inputPreview == nil)
+                .controlSize(.large)
+                .disabled(engine.items.isEmpty || pendingCount == 0)
             }
+
+            if doneCount > 0 {
+                Button {
+                    Task { await engine.saveAllToPhotos() }
+                } label: {
+                    Label("全部保存到相册（\(doneCount)）", systemImage: "square.and.arrow.down.on.square")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+                .disabled(engine.isRunning)
+            }
+        }
+    }
+
+    // MARK: - 文件导入
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            importing = true
+            Task {
+                var idx = engine.items.count
+                for url in urls {
+                    idx += 1
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    guard let data = try? Data(contentsOf: url) else { continue }
+                    engine.add(data: data, name: url.lastPathComponent, fallbackIndex: idx)
+                }
+                importing = false
+            }
+        case .failure(let error):
+            engine.notice = "导入失败：\(error.localizedDescription)"
         }
     }
 
@@ -247,31 +431,42 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    helpBlock("本地运行", "所有推理都在设备上完成，图片不上传任何服务器。")
-                    helpBlock("倍率说明", "模型原生 4×。1.5×/2×/2.5×/3× 是「4× 重建后缩回」，画质仍优于直接插值；6×/8× 是「4× 后用 Lanczos 再放大」，细节是模型猜出来的，不会凭空多出真实信息。")
-                    helpBlock("尺寸上限", "单图输出限制 8192px / 24MP，避免内存被打爆。原图很大时，AI 会先按长边 1024px 重建再缩放到目标，这是移动端的现实取舍。")
-                    helpBlock("关于 AI", "超分模型会「补」出它认为合理的细节，人脸、文字、纹理可能被改写。重要照片请保留原图。")
-                    helpBlock("自签安装", "免费 Apple ID 签名有效期 7 天，到期需重新签名安装；想长期免签需付费开发者账号。")
-                    helpBlock("功耗", "AI 推理走 Neural Engine，连续处理多张会发热降频，属正常现象。")
+                    Text("这是 PixelLift 的第一个版本，只包含图片处理。视频超分、补帧、慢动作、动态模糊、SDR→HDR 在后续版本。")
+                        .font(.subheadline)
+
+                    Divider()
+
+                    bullet("全部在本机推理，图片不上传、不需要网络。")
+                    bullet("原生 AI 倍率为 4×；选 1.5×/2×/2.5×/3× 时先在 4× 上重建再缩回，选 6×/8× 时重建后再放大——所以界面会标注「AI 原生」还是「AI+缩放」。")
+                    bullet("原图长边超过 1024px 时，AI 先按 1024px 重建再放大到目标尺寸，这是移动端内存的折中。")
+                    bullet("单张输出上限 8192px / 2400 万像素，超出会自动限制并在图上标注。")
+                    bullet("分块推理带 32px 重叠并丢弃边缘，拼接处不会有接缝和白边。")
+                    bullet("处理中可暂停/继续/取消；一批里的每一张都有独立进度。")
+                    bullet("保存到相册需要相册写入权限；也可以点每行的分享按钮直接导出到「文件」。")
+
+                    Divider()
+
+                    Text("模型：Real-ESRGAN x4（BSD 3-Clause，作者 Xintao Wang），在构建时转换为 Core ML，不随本 App 分发训练代码。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 .padding()
             }
-            .navigationTitle("说明")
+            .navigationTitle("关于与说明")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button("好") { showHelp = false }
+                    Button("关闭") { showHelp = false }
                 }
             }
         }
     }
 
-    private func helpBlock(_ title: String, _ body: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.subheadline.weight(.semibold))
-            Text(body).font(.footnote).foregroundStyle(.secondary)
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("·").font(.subheadline.weight(.bold))
+            Text(text).font(.subheadline)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
