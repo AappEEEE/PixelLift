@@ -250,8 +250,8 @@ enum FrameOps {
         } catch {
             return nil
         }
-        guard let observation = request.results?.first as? VNPixelBufferObservation,
-              let buffer = observation.pixelBuffer else { return nil }
+        guard let observation = request.results?.first as? VNPixelBufferObservation else { return nil }
+        let buffer = observation.pixelBuffer
 
         CVPixelBufferLockBaseAddress(buffer, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
