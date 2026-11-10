@@ -1,0 +1,20 @@
+# Xcode / SPM
+build/
+DerivedData/
+*.xcodeproj
+*.xcworkspace
+PixelLift.xcodeproj/
+App/Info.plist
+
+# 生成的模型与权重（体积大，由 CI 生成）
+Models/*.mlpackage/
+models/
+weights/
+Payload/
+*.ipa
+
+# 系统
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc

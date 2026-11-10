@@ -1,0 +1,109 @@
+name: iOS Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache converted models
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: Models
+          key: coreml-models-v1-${{ runner.os }}-${{ hashFiles('scripts/convert_coreml.py') }}
+
+      - name: Install converter deps
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "numpy<2" torch==2.4.1 coremltools==8.1
+
+      - name: Convert Real-ESRGAN weights to Core ML (zero training)
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: python scripts/convert_coreml.py --out Models
+
+      - name: List models
+        run: ls -la Models || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Toolchain info
+        run: xcodebuild -version
+
+      - name: Archive (unsigned)
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project PixelLift.xcodeproj \
+            -scheme PixelLift \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/PixelLift.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_ENTITLEMENTS=""
+
+      - name: Package unsigned IPA
+        run: |
+          ls -la build/PixelLift.xcarchive/Products/Applications/
+          mkdir -p Payload
+          cp -R build/PixelLift.xcarchive/Products/Applications/PixelLift.app Payload/
+          zip -qry PixelLift-unsigned.ipa Payload
+          ls -lh PixelLift-unsigned.ipa
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PixelLift-unsigned-ipa
+          path: PixelLift-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: PixelLift v0.1.${{ github.run_number }} · 图片 AI 超分
+          make_latest: true
+          files: PixelLift-unsigned.ipa
+          fail_on_unmatched_files: true
+          body: |
+            **PixelLift** 是 iOS 上的本地视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
+
+            这是 **第一个版本，只包含图片处理**：图片 AI 超分。
+
+            ### 本版能力
+            - 原生 4× AI 重建（Real-ESRGAN 权重转 Core ML，设备端推理，不上传）
+            - 倍率 1.5× / 2× / 2.5× / 3× / 4× / 6× / 8× + 自定义宽度
+            - 两档模型：照片/实拍、动漫/插画
+            - 暂停 / 继续 / 取消，分块推理与进度显示
+            - 导出 PNG / JPEG，或直接存入相册
+
+            ### 安装（免费 Apple ID，7 天有效）
+            下载本页 `PixelLift-unsigned.ipa`，用 Sideloadly / AltStore 自签安装，再在「设置 → 通用 → VPN与设备管理」里信任证书。到期重签即可，不需要付费开发者账号。
+
+            ### 已知取舍
+            - 原生 4×，其它倍率在 4× 结果上缩放
+            - 原图过大时 AI 先按长边 1024px 重建再放大（移动端内存限制）
+            - 输出上限 8192px / 24MP
