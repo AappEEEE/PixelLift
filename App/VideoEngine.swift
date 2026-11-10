@@ -1,4 +1,5 @@
 import AVFoundation
+import Accelerate
 import CoreImage
 import CoreML
 import CryptoKit
@@ -540,33 +541,31 @@ enum FrameOps {
         }
     }
 
-    /// 轻量 USM：3×3 盒式模糊做低频，按 amount 把高频加回去。
-    /// 缩放后画面天然偏软，这一步相当于 Topaz 的 «Add Detail»，但幅度小、不产生明显白边。
+    /// 轻量 USM：等价于 out = src + amount × (src − 3×3 均值)，写成一次卷积在 vImage 里跑。
+    /// 纯 Swift 逐像素做 1080p 要几百毫秒一帧，会拖垮「快速放大」的实时感，所以走 Accelerate。
     static func unsharp(_ rgba: inout [UInt8], w: Int, h: Int, amount: Float) {
-        guard amount > 0.001, w > 2, h > 2 else { return }
-        let n = w * h * 4
-        guard rgba.count >= n else { return }
-        var src = rgba
-        src.withUnsafeBufferPointer { sBuf in
-            rgba.withUnsafeMutableBufferPointer { dBuf in
-                for y in 1..<(h - 1) {
-                    for x in 1..<(w - 1) {
-                        let o = (y * w + x) * 4
-                        for c in 0..<3 {
-                            var sum: Float = 0
-                            for dy in -1...1 {
-                                for dx in -1...1 {
-                                    sum += Float(sBuf[o + dy * w * 4 + dx * 4 + c])
-                                }
-                            }
-                            let low = sum / 9
-                            let high = Float(sBuf[o + c]) - low
-                            let v = Float(sBuf[o + c]) + high * amount
-                            dBuf[o + c] = UInt8(min(255, max(0, v.rounded())))
-                        }
-                        dBuf[o + 3] = 255
-                    }
-                }
+        guard amount > 0.001, w > 2, h > 2, rgba.count >= w * h * 4 else { return }
+        let a = Double(amount)
+        let neg = Int16((-a / 9.0 * 256.0).rounded())
+        let center = Int16(((1.0 + a) - a / 9.0) * 256.0).rounded()
+        var kernel: [Int16] = [neg, neg, neg, neg, center, neg, neg, neg, neg]
+        var background: [UInt8] = [0, 0, 0, 0]
+        rgba.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            guard let scratch = malloc(raw.count) else { return }
+            defer { free(scratch) }
+            var src = vImage_Buffer(data: base,
+                                    height: vImagePixelCount(h),
+                                    width: vImagePixelCount(w),
+                                    rowBytes: w * 4)
+            var dst = vImage_Buffer(data: scratch,
+                                    height: vImagePixelCount(h),
+                                    width: vImagePixelCount(w),
+                                    rowBytes: w * 4)
+            let err = vImageConvolve_ARGB8888(&src, &dst, nil, 0, 0, &kernel, 3, 3, 256,
+                                              &background, vImage_Flags(kvImageEdgeExtend))
+            if err == kvImageNoError, let out = dst.data {
+                memcpy(base, out, raw.count)
             }
         }
     }
