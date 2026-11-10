@@ -1187,6 +1187,7 @@ final class VideoEngine: ObservableObject {
 
     init() {
         loadModels()
+        JobStore.pruneStale()
     }
 
     private func loadModels() {
@@ -1678,7 +1679,9 @@ enum JobStore {
             settings.useAI ? "ai\(settings.aiLongEdge)" : "fast",
             "p\(settings.samplesPerPair)a\(Int(settings.shutterAngle))m\(settings.blurSampleBudget)l\(settings.blurLinearLight ? "1" : "0")",
             "q\(Int((settings.detail * 100).rounded()))d\(Int((settings.denoise * 100).rounded()))f\(settings.antiFlicker ? "1" : "0")",
-            settings.hdrEnabled ? "hdr" : "sdr"
+            settings.hdrEnabled ? "hdr" : "sdr",
+            // 带上版本号：编码参数/分片格式一变，旧断点就不该被复用（宁可重跑，也不拼出坏文件）。
+            (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "-"
         ].joined(separator: "|")
         return SHA256.hash(data: Data(descriptor.utf8))
             .map { String(format: "%02x", $0) }
@@ -1691,6 +1694,22 @@ enum JobStore {
         let url = dir(for: key).appendingPathComponent("job.json")
         guard let data = try? Data(contentsOf: url) else { return nil }
         return try? JSONDecoder().decode(JobRecord.self, from: data)
+    }
+
+    /// 清掉超过 7 天没动过的任务目录：分片文件很占空间，放弃的任务不该永久堆在 Documents 里。
+    static func pruneStale(days: Double = 7) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: root.path) else { return }
+        let cutoff = Date().addingTimeInterval(-days * 86_400)
+        for name in names {
+            let folder = root.appendingPathComponent(name, isDirectory: true)
+            let probe = folder.appendingPathComponent("job.json")
+            let stamp = (try? fm.attributesOfItem(atPath: probe.path))?[.modificationDate] as? Date
+            let when = stamp ?? ((try? fm.attributesOfItem(atPath: folder.path))?[.creationDate] as? Date)
+            if let when, when < cutoff {
+                try? fm.removeItem(at: folder)
+            }
+        }
     }
 
     static func save(_ record: JobRecord) {
