@@ -72,10 +72,10 @@ jobs:
           rm -rf Payload && mkdir -p Payload
           cp -R build/PixelLift.xcarchive/Products/Applications/PixelLift.app Payload/
           chmod 755 Payload/PixelLift.app/PixelLift
-          # ditto 产出的 zip 是 Apple 标准包（无 AppleDouble、权限保留、Payload/ 在根），
-          # LiveContainer / Sideloadly / AltStore 都按这个格式解析。
+          # zip 包最保守：根只有 Payload/，无 __MACOSX / AppleDouble，权限位仍是 unix
+          # （后者是部分安装器判定「不是 IPA」的原因）
           rm -f PixelLift.ipa
-          ditto -c -k --sequesterRsrc --keepParent Payload PixelLift.ipa
+          zip -r -X -q PixelLift.ipa Payload
           shasum -a 256 PixelLift.ipa | tee PixelLift.ipa.sha256
           ls -lh PixelLift.ipa
           unzip -l PixelLift.ipa | head -20
@@ -96,7 +96,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
-          name: PixelLift v0.1.${{ github.run_number }} · 图片超分 + 视频增强（首版）
+          name: PixelLift v0.1.${{ github.run_number }} · 图片超分 + 视频补帧（M3）
           make_latest: true
           files: |
             PixelLift.ipa
@@ -106,12 +106,20 @@ jobs:
             **PixelLift** 是 iOS 上的本地视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
             图片和视频在一个 App 里，处理全在本机，不上传、不订阅。
 
-            ### 本版新增：视频增强（M2 第一版）
+            ### 本版新增：补帧 / 慢动作 / 动态模糊（M3）
+            - **光流补帧** ×2 / ×4：Vision `VNGenerateOpticalFlowRequest` 求逐像素位移，
+              双向 warp 后按相位融合，30fps 变 60/120fps
+            - **慢动作** 0.5× / 0.25×：时间轴拉长，多出来的采样点全部由光流合成
+            - **动态模糊** 轻 / 强：同一时刻前后 3 / 5 个采样加权平均，近似快门拖影
+            - 三者与超分、倍率正交组合；慢动作改时长，所以这一单不带原音轨
+            - 补帧或慢动作把输出限制在 1080p 级、动态模糊再降一档，保证单帧耗时可控
+            - 页面顶部/底部可切「图片 / 视频」两个标签
+
+            ### 视频侧（M2 起）
             - 相册选视频或「文件」导入，读出分辨率 / 时长 / 帧率
             - **快速放大**：CoreGraphics 高质量重采样，接近实时
             - **AI 逐帧超分**：每帧分块跑 Real-ESRGAN（照片 / 动漫两档模型）
-            - 倍率 1.5× / 2× / 3× / 4×，输出上限 4K / 830 万像素
-            - HEVC 封装 mp4，音频原样透传，进度 / 暂停 / 取消 / 存相册 / 分享
+            - 输出上限 4K / 830 万像素，HEVC 封装 mp4，进度 / 暂停 / 取消 / 存相册 / 分享
 
             ### 图片侧（沿用上一版，已修 AI 重建分辨率）
             - 原生 4× AI 重建，倍率 1.5×~8× + 自定义宽度，批量处理、文件导入
@@ -126,6 +134,7 @@ jobs:
 
             ### 已知取舍
             - AI 逐帧超分按帧计时，10 秒 30fps 的片子要几分钟，处理时保持前台
-            - 补帧 / 慢动作 / 动态模糊 / SDR→HDR 还在路线图里（M3 起）
-            - 视频输出统一重编码为 HEVC，不做逐帧 EXIF / 元数据保留
+            - 补帧走光流，大面积遮挡 / 闪烁 / 快速横移处可能有轻微拖影
+            - 慢动作不带音轨；SDR→HDR 仍在路线图（v0.5）
+            - 视频输出统一重编码为 HEVC，不做逐帧元数据保留
 

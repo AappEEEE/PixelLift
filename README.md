@@ -1,9 +1,10 @@
 # PixelLift
 
-**iOS 视频画质增强工具**（本地运行、零上传、零订阅）。
+**iOS 图片 / 视频画质增强工具**（本地运行、零上传、零订阅）。
 
-目标能力：AI 超分、AI 补帧、慢动作、动态模糊、SDR→HDR。
-**当前第一个 Release 只包含图片处理（AI 超分）**，视频管线在后续版本。
+一个 App 两套能力：图片 AI 超分 + 视频超分 / 补帧 / 慢动作 / 动态模糊。
+
+## 图片
 
 - 原生 **4×** AI 重建（Real-ESRGAN 现成权重转 Core ML，零训练）
 - 倍率：**1.5× / 2× / 2.5× / 3× / 4× / 6× / 8×** + 自定义宽度
@@ -11,34 +12,47 @@
 - **批量处理**：相册多选（最多 20 张）或从「文件」无限导入，逐张独立进度
 - 暂停 / 继续 / 取消，分块推理实时进度
 - 导出 PNG / JPEG，或一键全部存入相册
-- 不需要任何特殊 entitlement → 免费 Apple ID 自签即可安装
+- AI 重建分辨率自动取「目标尺寸 ÷ 4」，上限长边 2048px，避免先砍细节再放大
+
+## 视频
+
+- 快速放大（CoreGraphics 高质量重采样）或 **AI 逐帧超分**
+- **光流补帧**（Vision `VNGenerateOpticalFlowRequest`）→ ×2 / ×4，30fps 变 60/120fps
+- **慢动作** 0.5× / 0.25×，中间帧同样由光流合成
+- **动态模糊**（多采样叠加，近似快门拖影）
+- 暂停 / 继续 / 取消，进度实时；输出 HEVC `.mp4`，只补帧时音频原样透传
+- 输出上限 4K / 830 万像素，补帧或慢动作降到 1080p 级，动态模糊再降一档
+
+不需要任何特殊 entitlement → 免费 Apple ID 自签 7 天即可安装。
 
 ## 路线
 
 | 版本 | 内容 | 状态 |
 |---|---|---|
-| **v0.1.x** | 图片 AI 超分（本文档描述的 M1） | 已发布 |
-| v0.2 | 视频通路：4K/HDR 直通、分片暂停续传 | 计划 |
-| v0.3 | AI 补帧（`VTFrameRateConversion`）+ 慢动作 + 音频重定时 | 计划 |
-| v0.4 | 视频超分 + 光流时域融合抗闪 | 计划 |
-| v0.5 | 动态模糊（Metal 快门角度） | 计划 |
-| v0.6 | SDR→HDR（HDRTVNet / ExpandNet 转 Core ML） | 计划 |
+| **v0.1.x** | 图片 AI 超分（M1） | 已发布 |
+| **v0.2** | 视频通路：重采样放大 / AI 逐帧超分（M2） | 已发布 |
+| **v0.3** | 光流补帧 + 慢动作 + 动态模糊（M3） | 已发布 |
+| v0.4 | 分片导出 + 暂停续传（长视频不爆内存） | 计划 |
+| v0.5 | SDR→HDR（HDRTVNet / ExpandNet 转 Core ML） | 计划 |
+| v0.6 | 逐帧超分抗闪烁（光流时域融合 + VT 时域降噪） | 计划 |
 
 ## 构建
 
-推送到 `main` 即自动构建，产物：
+推送到 `main` 即自动构建（GitHub Actions `macos-15`），产物：
 
-- GitHub Actions Artifacts：`PixelLift-unsigned-ipa`
-- GitHub Releases：`PixelLift-unsigned.ipa`（每次构建一个新 tag）
+- Artifacts：`PixelLift-ipa-v0.1.N`（内含 `PixelLift.ipa` + `PixelLift.ipa.sha256`）
+- Releases：`PixelLift.ipa` + `PixelLift.ipa.sha256`（每次构建一个新 tag）
 
-详见 [docs/构建与装机.md](docs/构建与装机.md)。
+安装与排错见 [docs/构建与装机.md](docs/构建与装机.md)；
+视频管线细节见 [docs/M3-视频-补帧与慢动作.md](docs/M3-视频-补帧与慢动作.md)。
 
 ## 目录
 
 ```
-App/             SwiftUI + Core ML 推理
+App/             SwiftUI + Core ML 推理 + 视频管线
 Models/          Core ML 模型（CI 生成，不入库）
-scripts/         Real-ESRGAN → Core ML 转换脚本
+scripts/         Real-ESRGAN → Core ML 转换、验证与推送脚本
+docs/            可行性、交付说明、构建装机、视频管线
 .github/         Actions：构建 + 发布 Release
 project.yml      XcodeGen 工程描述
 ```
@@ -46,4 +60,5 @@ project.yml      XcodeGen 工程描述
 ## 许可证
 
 本仓库代码：自用无限制。
-`RealESRGANGeneral` / `RealESRGANAnime` 权重来自 [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)，**BSD 3-Clause**，需保留版权声明。商用请自行核对条款。
+`RealESRGANGeneral` / `RealESRGANAnime` 权重来自 [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)，**BSD 3-Clause**，需保留版权声明。
+光流合成部分只调用系统 Vision 框架，未引入第三方推理库。
