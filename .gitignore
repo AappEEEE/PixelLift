@@ -17,6 +17,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 _verify/
+_dl/
+_lc/
 # 本地产物 / 用户素材
 微信图片*
 docs/quality/

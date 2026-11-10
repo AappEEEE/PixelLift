@@ -4,7 +4,7 @@ import SwiftUI
 struct PixelLiftApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
     }
 }

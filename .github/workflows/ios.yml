@@ -69,19 +69,26 @@ jobs:
       - name: Package unsigned IPA
         run: |
           ls -la build/PixelLift.xcarchive/Products/Applications/
-          mkdir -p Payload
+          rm -rf Payload && mkdir -p Payload
           cp -R build/PixelLift.xcarchive/Products/Applications/PixelLift.app Payload/
-          IPA="PixelLift-v0.1.${{ github.run_number }}-unsigned.ipa"
-          zip -qry "$IPA" Payload
-          ls -lh "$IPA"
+          chmod 755 Payload/PixelLift.app/PixelLift
+          # ditto 产出的 zip 是 Apple 标准包（无 AppleDouble、权限保留、Payload/ 在根），
+          # LiveContainer / Sideloadly / AltStore 都按这个格式解析。
+          rm -f PixelLift.ipa
+          ditto -c -k --sequesterRsrc --keepParent Payload PixelLift.ipa
+          shasum -a 256 PixelLift.ipa | tee PixelLift.ipa.sha256
+          ls -lh PixelLift.ipa
+          unzip -l PixelLift.ipa | head -20
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Payload/PixelLift.app/Info.plist
           /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Payload/PixelLift.app/Info.plist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PixelLift-unsigned-ipa
-          path: PixelLift-v*-unsigned.ipa
+          name: PixelLift-ipa-v0.1.${{ github.run_number }}
+          path: |
+            PixelLift.ipa
+            PixelLift.ipa.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -89,32 +96,36 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
-          name: PixelLift v0.1.${{ github.run_number }} · 图片 AI 超分
+          name: PixelLift v0.1.${{ github.run_number }} · 图片超分 + 视频增强（首版）
           make_latest: true
-          files: PixelLift-v*-unsigned.ipa
+          files: |
+            PixelLift.ipa
+            PixelLift.ipa.sha256
           fail_on_unmatched_files: true
           body: |
             **PixelLift** 是 iOS 上的本地视频画质增强工具（AI 超分 / 补帧 / 慢动作 / 动态模糊 / SDR→HDR）。
+            图片和视频在一个 App 里，处理全在本机，不上传、不订阅。
 
-            这是 **第一个版本，只包含图片处理**：图片 AI 超分。
+            ### 本版新增：视频增强（M2 第一版）
+            - 相册选视频或「文件」导入，读出分辨率 / 时长 / 帧率
+            - **快速放大**：CoreGraphics 高质量重采样，接近实时
+            - **AI 逐帧超分**：每帧分块跑 Real-ESRGAN（照片 / 动漫两档模型）
+            - 倍率 1.5× / 2× / 3× / 4×，输出上限 4K / 830 万像素
+            - HEVC 封装 mp4，音频原样透传，进度 / 暂停 / 取消 / 存相册 / 分享
 
-            ### 本版能力
-            - 原生 4× AI 重建（Real-ESRGAN 权重转 Core ML，设备端推理，不上传）
-            - 倍率 1.5× / 2× / 2.5× / 3× / 4× / 6× / 8× + 自定义宽度
-            - 两档模型：照片/实拍、动漫/插画
-            - **批量处理**：相册多选（≤20 张）或「文件」导入（不限张数），每张独立进度
-            - 暂停 / 继续 / 取消；分块推理实时进度条
-            - 导出 PNG / JPEG，或一键全部存入相册
+            ### 图片侧（沿用上一版，已修 AI 重建分辨率）
+            - 原生 4× AI 重建，倍率 1.5×~8× + 自定义宽度，批量处理、文件导入
+            - AI 输入分辨率改为「目标尺寸 ÷ 4」（上限长边 2048px），不再固定 1024px
+            - 进度条带过渡动画
 
-            ### 本版修复
-            - 修复输出图左侧/顶部出现白边或错位（分块拼接偏移了 32 个源像素）
-            - 修复进度条从 0% 直接跳 100%（推理移到后台线程，逐块回报进度）
-            - 新增「从文件导入」与批量队列
-
-            ### 安装（免费 Apple ID，7 天有效）
-            下载本页 `PixelLift-unsigned.ipa`，用 Sideloadly / AltStore 自签安装，再在「设置 → 通用 → VPN与设备管理」里信任证书。到期重签即可，不需要付费开发者账号。
+            ### 安装
+            1. 点本页 `PixelLift.ipa` 下载（**确认已真正下载到本机**，别停在 iCloud 云图标状态）；
+            2. 需要校验的话，`PixelLift.ipa.sha256` 是同一版本的 sha256，比对大小和哈希可排除半截包；
+            3. LiveContainer：`+` → 从 IPA 安装 → 选文件；装不上时优先确认文件在「我的 iPhone」本地目录；
+            4. 也可用 Sideloadly / AltStore 自签（免费 Apple ID，7 天有效，到期重签）。
 
             ### 已知取舍
-            - 原生 4×，其它倍率在 4× 结果上缩放
-            - 原图过大时 AI 先按长边 1024px 重建再放大（移动端内存限制）
-            - 输出上限 8192px / 24MP
+            - AI 逐帧超分按帧计时，10 秒 30fps 的片子要几分钟，处理时保持前台
+            - 补帧 / 慢动作 / 动态模糊 / SDR→HDR 还在路线图里（M3 起）
+            - 视频输出统一重编码为 HEVC，不做逐帧 EXIF / 元数据保留
+
