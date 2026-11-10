@@ -323,7 +323,7 @@ struct VideoView: View {
 
     private var detailCard: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Label("细节增强", systemImage: "wand.and.rays")
+            Label("细节与降噪", systemImage: "wand.and.rays")
                 .font(.headline)
             HStack {
                 Text("锐度")
@@ -334,7 +334,22 @@ struct VideoView: View {
                     .monospacedDigit()
                     .frame(width: 44, alignment: .trailing)
             }
-            Text("缩放到目标尺寸后做一遍轻微 USM，把重采样吃掉的高频补回来。0 表示完全不加，20–40% 通常最自然也最安全。")
+            HStack {
+                Text("降噪")
+                    .font(.caption)
+                Slider(value: $engine.denoise, in: 0...1, step: 0.05)
+                Text("\(Int(engine.denoise * 100))%")
+                    .font(.caption)
+                    .monospacedDigit()
+                    .frame(width: 44, alignment: .trailing)
+            }
+            Toggle(isOn: $engine.antiFlicker) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("抗闪烁").font(.subheadline)
+                    Text("只在 AI 逐帧超分时生效").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            Text("锐化在亮度域做，且把输出钳在源局部极值内，所以不会出白边光晕（halo）。降噪只压小幅度残差，边缘不动；0 表示不加。抗闪烁按光流和亮度差逐像素决定要不要跟上一帧融合，静止画面更稳、运动画面不拖影。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
@@ -449,7 +464,7 @@ struct VideoView: View {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "-"
         let build = info["CFBundleVersion"] as? String ?? "-"
-        return Text("v\(version) (build \(build)) · 视频 HDR HLG 版")
+        return Text("v\(version) (build \(build)) · 视频 M6+M7 画质版")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity)

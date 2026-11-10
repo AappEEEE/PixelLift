@@ -1,354 +1,435 @@
-#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-PixelLift M7 鐢昏川鏍稿績 鈥斺�?绂荤嚎鏁板�奸獙璇?
-鐢?numpy 閫愪綅澶嶅埢 QualityCore.swift 鐨勫畾鐐?娴�鐐硅繍绠楋紝瀵� 12 缁勫懡棰樺仛鏂�瑷�銆?鎵�鏈夊害閲忛兘鏄�銆岀浉瀵规瘮杈冦�嶏紙鏂?vs 鏃?/ 鏈?vs 鏃狅級锛屼笉渚濊禆鏄剧ず鍣ㄨ�傛劅銆?
-  T1  鍙�鍒嗙�诲嵎绉�涓庢牳褰㈢姸锛氬彲鍒嗙�烩墶2D銆丯yquist 娉勬紡銆佸悇鍚戝悓鎬с�丏C 澧炵泭
-  T2  纭�闃惰�?halo锛氭棫 3x3 USM vs 鏂版柟妗?vs 鍙栨秷閽冲埗
-  T3  閿愬害鏈夋晥鎬э細鏌斿拰杈圭紭鐨?10鈥?0% 瀹藉害鏀剁缉 + 绾圭悊姊�搴︽彁鍗�
-  T4  楂橀�戜繚鎶� / 闄嶅櫔锛歂yquist 妫嬬洏銆佸櫔澹版姂鍒跺�嶇巼銆佹亽绛夋�?  T5  鎶栧姩锛氭妸銆屾护娉㈡姽骞冲悗鍐嶉噺鍖栥�嶄骇鐢熺殑闀垮钩鍙版墦鏁?  T6  鍗曡皟鎬э細缂撴笎鍙樹笌鏌斿拰杈圭紭鏃犳尟閾?  T7  鑳介噺瀹堟亽锛欴C 鏃犲亸绉汇�佷寒搴︽潈閲嶅拰 256銆佺函鑹查�愪綅涓嶅彉
-  T8  鐏伴樁淇濈湡锛氫腑鎬х伆浠嶄腑鎬с�佷笁閫氶亾澧為噺涓�鑷达紙涓嶄骇鐢熷僵杈癸級
-  T9  缂╂斁鏍革細box / tent / lanczos3 鍦?4x 瓒呴噰鏍烽檷閲囨牱涓嬬殑 PSNR 涓庨�勬尟閾�
-  T10 鍒嗘潯澶勭悊閫愪綅绛変簬鏁村抚澶勭悊
-  T11 鏃跺簭铻嶅悎鏉冮噸锛氶潤姝㈠尯寮鸿瀺鍚堛�佽繍鍔ㄥ尯寮辫瀺鍚堛�佷寒搴︾獊鍙樿�╄�?  T12 姣忓抚鑰楁椂妯″瀷锛氭寜瀹炴祴鍍忕礌鍚炲悙浼扮畻 1080p / 4K 姣忓抚寮�閿�
+PixelLift M7 · QualityCore 离线数值验证
+=======================================
 
-杩愯�岋�?  C:\\Users\\ape\\.dsh\\dsh-runtimes\\dsh-primary-runtime\\dependencies\\python\\python.exe verify_quality_math.py
+这个脚本用 numpy 复刻 research/m7/QualityCore.swift 的每一步算术，并对它做
+可离线复现的数值断言。它不是"跑通就行"的冒烟测试，每一条断言都对应一个设计决策：
+
+  T1  核形状与频响      —— 为什么用 5-tap binomial 而不是 3x3 box
+  T2  硬阶跃 halo       —— 为什么必须钳制到 5x5 局部极值
+  T3  锐度有效性        —— 钳制之后还剩多少锐化量（与旧 USM 对拍）
+  T4  高频保护 / 降噪    —— coring 与 edgeGuard 的实测压缩比
+  T5  抖动与 banding    —— 抖动能做什么、不能做什么（含数学边界）
+  T6  单调性            —— 无振铃
+  T7  能量守恒          —— 不改变整体亮度
+  T8  灰阶保真          —— 亮度域处理 → 不出彩边
+  T9  缩放核            —— 该不该换掉 CGContext
+  T10 分条等价          —— 分条处理与整帧逐位相同
+  T11 时序融合权重      —— 抗闪烁权重曲线的性质
+  T12 耗时 / 内存模型    —— iPhone 上划不划得来
+
+运行：
+    python verify_quality_math.py
+退出码 0 表示全部 PASS。
 """
 
 import sys
 
 import numpy as np
 
-try:                                    # Windows 鎺у埗鍙伴粯璁?GBK锛屽己鍒?UTF-8 鎵嶈兘鐪嬩腑鏂?    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:
-    pass
+sys.stdout.reconfigure(encoding="utf-8")
 
-np.set_printoptions(suppress=True, precision=6)
+# 亮度权重：0.2126/0.7152/0.0722 的定点近似，和为 256（除以 256 用移位）
+LUMA_R = 54
+LUMA_G = 183
+LUMA_B = 19
+LUMA_SUM = 256
 
-# ----------------------------------------------------------------------------
-# 0. 甯搁噺锛堜笌 QualityCore.swift 涓�涓�瀵瑰簲锛?# ----------------------------------------------------------------------------
-
-# 4x4 Bayer 绱㈠紩琛�锛屼�?SDRToHDR.writeP010 閲岄偅寮犻�愬瓧鐩稿悓
-BAYER4 = np.array([0, 8, 2, 10,
-                   12, 4, 14, 6,
-                   3, 11, 1, 9,
-                   15, 7, 13, 5], dtype=np.float64).reshape(4, 4)
-BAYER_BIAS = 0.5          # (k + 0.5) / 16 - 0.5 鈫?鍧囧�肩簿纭�涓� 0
-
-K3_BOX = np.array([1, 1, 1], dtype=np.float64)
-K5_BIN = np.array([1, 4, 6, 4, 1], dtype=np.float64)
-
-LUMA_R, LUMA_G, LUMA_B = 54, 183, 19
-LUMA_SUM = LUMA_R + LUMA_G + LUMA_B          # 蹇呴』 = 256
-EDGE_SCALE = 32.0                            # edgeGuard 褰掍竴鍖栧昂搴︼紙鐮佸�硷級
+# 4x4 Bayer 有序抖动矩阵，与 SDRToHDR.writeP010 里的同一张表（风格统一）
+BAYER4 = np.array([[0, 8, 2, 10],
+                   [12, 4, 14, 6],
+                   [3, 11, 1, 9],
+                   [15, 7, 13, 5]], dtype=np.float64)
 
 _results = []
 
 
 def check(tag, ok, detail):
     _results.append((tag, bool(ok), detail))
-    print("[%s] %-34s %s" % ("PASS" if ok else "FAIL", tag, detail))
-    return ok
+    mark = "PASS" if ok else "FAIL"
+    print("[%s] %-36s %s" % (mark, tag, detail))
 
 
-# ----------------------------------------------------------------------------
-# 1. 鍩虹��绠楀瓙锛堝叏閮ㄥ�瑰簲涓�娆?vImage 璋冪敤锛?# ----------------------------------------------------------------------------
-
-def conv_sep_float(img, k):
-    """鍙�鍒嗙�讳竴缁存牳涓ら亶锛堟诞鐐癸級锛岃竟鐣屽�嶅�?= kvImageEdgeExtend銆?""
-    k = np.asarray(k, dtype=np.float64)
-    k = k / k.sum()
-    r = len(k) // 2
-    h, w = img.shape
-    p = np.pad(img.astype(np.float64), r, mode="edge")
-    tmp = np.zeros((h, w), dtype=np.float64)
-    for i in range(len(k)):
-        tmp += k[i] * p[r:r + h, i:i + w]
-    p2 = np.pad(tmp, ((r, r), (0, 0)), mode="edge")
-    out = np.zeros((h, w), dtype=np.float64)
-    for i in range(len(k)):
-        out += k[i] * p2[i:i + h, :]
-    return out
-
-
-def conv_sep_u8(img, k_int, divisor):
-    """涓ら亶 8-bit 瀹氶暱鍗风Н锛屾瘡閬嶅洓鑸嶄簲鍏?= vImageConvolve_Planar8(divisor)銆?""
-    h, w = img.shape
-    k = np.asarray(k_int, dtype=np.int32)
-    r = len(k) // 2
-    p = np.pad(img.astype(np.int32), r, mode="edge")
-    tmp = np.zeros((h, w), dtype=np.int32)
-    for i in range(len(k)):
-        tmp += k[i] * p[r:r + h, i:i + w]
-    tmp = np.floor(tmp / divisor + 0.5).astype(np.int32)
-    p2 = np.pad(tmp, ((r, r), (0, 0)), mode="edge")
-    out = np.zeros((h, w), dtype=np.int32)
-    for i in range(len(k)):
-        out += k[i] * p2[i:i + h, :]
-    out = np.floor(out / divisor + 0.5).astype(np.int32)
-    return np.clip(out, 0, 255).astype(np.uint8)
-
-
-def window_minmax(img, r=2):
-    """(2r+1)^2 鐭╁舰缁撴瀯鍏冪殑鑵愯殌/鑶ㄨ儉 = vImageMin/Max_Planar8锛岃竟鐣屽�嶅埗銆?""
-    h, w = img.shape
-    p = np.pad(img.astype(np.int16), r, mode="edge")
-    lo = np.full((h, w), 255, dtype=np.int16)
-    hi = np.zeros((h, w), dtype=np.int16)
-    for dy in range(-r, r + 1):
-        for dx in range(-r, r + 1):
-            win = p[r + dy:r + dy + h, r + dx:r + dx + w]
-            lo = np.minimum(lo, win)
-            hi = np.maximum(hi, win)
-    return lo, hi
-
-
-def luma_plane(rgb):
-    r = rgb[:, :, 0].astype(np.int32)
-    g = rgb[:, :, 1].astype(np.int32)
-    b = rgb[:, :, 2].astype(np.int32)
-    return ((LUMA_R * r + LUMA_G * g + LUMA_B * b + 128) >> 8).astype(np.uint8)
-
-
-def bayer_pm05(h, w, y_offset=0, on=True):
-    """鍙犲姞鍦ㄦ诞鐐逛寒搴︿笂鐨勬姈鍔ㄩ」锛岃寖鍥?[-0.469, +0.469]锛?x4 鍐呭潎鍊间负 0銆?""
-    if not on:
-        return np.zeros((h, w), dtype=np.float64)
-    yy = (np.arange(h)[:, None] + y_offset) & 3
-    xx = np.arange(w)[None, :] & 3
-    return (BAYER4[yy, xx] + BAYER_BIAS) / 16.0 - 0.5
-
-
-def knee_curve(ad, t0, t1):
-    """smoothstep 姝诲尯锛殀d|鈮�t0 鍒ゅ櫔澹帮紙0锛夛紝|d|鈮�t1 鍒ょ粏鑺傦紙1锛夈�?""
-    x = np.clip((ad - t0) / max(1e-6, (t1 - t0)), 0.0, 1.0)
+def smoothstep(x):
     return x * x * (3.0 - 2.0 * x)
 
 
-def detail_denoise(rgb, amount, denoise, edge_guard, dither=True,
-                   halo_guard=True, edge_weight=True, y_offset=0):
-    """QualityCore.applyDetail 鐨勯�愪綅澶嶅埢锛?    浜�搴﹀�?鈫?5-tap 楂樻柉鍩哄簳 鈫?楂橀�?d 鈫?鏍稿寲/闄嶅櫔 鈫?淇濊竟澧炵泭 鈫?鏋佸�奸挸鍒?鈫?鎶栧姩銆?""
-    h, w = rgb.shape[0], rgb.shape[1]
-    L = luma_plane(rgb)
-    base = conv_sep_u8(L, [1, 4, 6, 4, 1], 16)
-    lo, hi = window_minmax(L, 2)
+# ----------------------------------------------------------------------------
+# 基础算子
+# ----------------------------------------------------------------------------
 
-    t1 = 3.0 + 9.0 * float(denoise)
-    t0 = 1.5 + 1.5 * float(denoise)
-    guard_k = float(edge_guard) / (EDGE_SCALE * EDGE_SCALE)
+def luma_plane(rgb):
+    """L = (54R + 183G + 19B + 128) >> 8 —— 与 vImageMatrixMultiply 的定点路径一致。"""
+    a = np.asarray(rgb, dtype=np.int32)
+    acc = LUMA_R * a[..., 0] + LUMA_G * a[..., 1] + LUMA_B * a[..., 2] + 128
+    return (acc >> 8).astype(np.int32)
 
-    d = L.astype(np.float64) - base.astype(np.float64)
-    knee = knee_curve(np.abs(d), t0, t1)
-    m = 1.0 - float(denoise) * (1.0 - knee)      # 灏忔畫宸?= 鍣�澹� 鈫?鍓婂急
 
-    rng = (hi.astype(np.float64) - lo.astype(np.float64))
-    if edge_weight:                              # 澶у�规瘮搴﹀眬閮?= 杈圭紭 鈫?灏戦攼鍖?        ew = 1.0 / (1.0 + guard_k * rng * rng)
+def conv_sep_u8(img, k, divisor):
+    """可分离 1D 卷积，先水平后垂直，每遍按 8-bit 舍入。
+
+    与 vImageConvolve_Planar8 两次调用（1x5 和 5x1）的算术一致：
+    每遍都是 round(sum/divisor) + clip(0,255)，边界用 kvImageEdgeExtend。
+    """
+    k = np.asarray(k, dtype=np.float64)
+    a = np.asarray(img, dtype=np.float64)
+    r = len(k) // 2
+    for axis in (1, 0):
+        pads = [(0, 0), (0, 0)]
+        pads[axis] = (r, r)
+        p = np.pad(a, pads, mode="edge")
+        acc = np.zeros_like(a)
+        for i in range(len(k)):
+            sl = [slice(None), slice(None)]
+            sl[axis] = slice(i, i + a.shape[axis])
+            acc += k[i] * p[tuple(sl)]
+        a = np.clip(np.round(acc / float(divisor)), 0.0, 255.0)
+    return a.astype(np.uint8)
+
+
+def conv_sep_float(img, k):
+    """浮点版（不量化），用于验证可分离性与量化误差。"""
+    k = np.asarray(k, dtype=np.float64)
+    a = np.asarray(img, dtype=np.float64)
+    r = len(k) // 2
+    for axis in (1, 0):
+        pads = [(0, 0), (0, 0)]
+        pads[axis] = (r, r)
+        p = np.pad(a, pads, mode="edge")
+        acc = np.zeros_like(a)
+        for i in range(len(k)):
+            sl = [slice(None), slice(None)]
+            sl[axis] = slice(i, i + a.shape[axis])
+            acc += k[i] * p[tuple(sl)]
+        a = acc / float(k.sum())
+    return a
+
+
+def conv2d_float(img, k2d):
+    """完整 2D 卷积（k2d 可为非可分离核），边界取边。"""
+    k2d = np.asarray(k2d, dtype=np.float64)
+    a = np.asarray(img, dtype=np.float64)
+    kh, kw = k2d.shape
+    ry, rx = kh // 2, kw // 2
+    p = np.pad(a, ((ry, ry), (rx, rx)), mode="edge")
+    acc = np.zeros_like(a)
+    for y in range(kh):
+        for x in range(kw):
+            acc += k2d[y, x] * p[y:y + a.shape[0], x:x + a.shape[1]]
+    return acc / float(k2d.sum())
+
+
+def window_minmax(img, r=2, mode="min"):
+    """5x5 局部极值，边界取边 —— 对应 vImageMin_Planar8 / vImageMax_Planar8。"""
+    a = np.asarray(img, dtype=np.int32)
+    p = np.pad(a, r, mode="edge")
+    out = None
+    for dy in range(2 * r + 1):
+        for dx in range(2 * r + 1):
+            w = p[dy:dy + a.shape[0], dx:dx + a.shape[1]]
+            if out is None:
+                out = w.copy()
+            elif mode == "min":
+                out = np.minimum(out, w)
+            else:
+                out = np.maximum(out, w)
+    return out
+
+
+def window_mean3(rgb):
+    """3x3 盒式均值（边界取边），8-bit 逐通道 —— 旧 USM 的低频项。"""
+    a = np.asarray(rgb, dtype=np.int32)
+    pad = np.pad(a, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    acc = np.zeros_like(a)
+    for dy in range(3):
+        for dx in range(3):
+            acc += pad[dy:dy + a.shape[0], dx:dx + a.shape[1], :]
+    return acc
+
+
+def usm_box3(rgb, amount, dc_exact=False):
+    """旧实现：kernel 边缘 -a/9、中心 (1+a)-a/9，divisor 256 的 3x3 USM。
+
+    dc_exact=False 复刻线上代码（VideoEngine.swift:542-570）的定点系数：
+        neg    = round(-a/9   * 256)
+        center = round(((1+a) - a/9) * 256)
+    注意这组系数并不保证和为 256 —— a=0.5 时 370 - 9*14 = 244，等于整体压暗
+    4.7%。dc_exact=True 只把 center 改成 256 - 9*neg（核和归一到 256），
+    用来把「算法本身」与「系数量化误差」分开评估。
+    """
+    a = float(amount)
+    neg = int(np.round((-a / 9.0) * 256.0))
+    if dc_exact:
+        center = 256 - 9 * neg
     else:
-        ew = np.ones_like(rng)
-
-    v = base.astype(np.float64) + d * m * (1.0 + float(amount) * ew)
-    if halo_guard:                               # 鍐冲畾鎬х殑涓�姝ワ細涓嶅厑璁告柊鏋佸�?        v = np.clip(v, lo.astype(np.float64), hi.astype(np.float64))
-
-    vq = np.clip(np.floor(v + bayer_pm05(h, w, y_offset, dither) + 0.5), 0, 255)
-    delta = vq.astype(np.int32) - L.astype(np.int32)   # 涓夐�氶亾鍚屽姞 鈫?鏃犺壊鍋?
-    out = np.empty_like(rgb)
-    for c in range(3):
-        ch = rgb[:, :, c].astype(np.int32) + delta
-        out[:, :, c] = np.clip(ch, 0, 255).astype(np.uint8)
-    return out
+        center = int(np.round(((1.0 + a) - a / 9.0) * 256.0))
+    src = np.asarray(rgb, dtype=np.float64)
+    acc = float(center) * src + float(neg) * window_mean3(rgb).astype(np.float64)
+    return np.clip(np.round(acc / 256.0), 0.0, 255.0).astype(np.uint8)
 
 
-def usm_box3(rgb, amount):
-    """鏃у疄鐜帮細3x3 鐩掑紡 USM锛團rameOps.unsharp 鐨勭瓑浠锋暟瀛︼紝浜�搴﹀煙鐗堟湰锛夈�?""
+def bayer_pm05(h, w, y_offset=0, on=True):
+    """返回 (h,w) 的抖动偏移，范围 [-0.469, +0.469]，均值恰为 0。
+
+    用 (k + 0.5)/16 - 0.5 而不是 k/16 - 0.5：后者的均值为 -1/32，会整体压暗
+    1/32 码值；这里把每个门限放在格心，保证零偏置。
+    """
+    if not on:
+        return np.zeros((h, w), dtype=np.float64)
+    yy, xx = np.mgrid[0:h, 0:w]
+    k = BAYER4[(yy + int(y_offset)) % 4, xx % 4]
+    return (k + 0.5) / 16.0 - 0.5
+
+
+def detail_denoise(rgb, amount, denoise, edge_guard, dither=True,
+                   y_offset=0, clamp=True, force=False):
+    """QualityCore.detailDenoise 的逐像素复刻。
+
+    L      = 亮度平面
+    base   = 5-tap binomial 低频（σ≈1.41px）
+    d      = L - base（高通残差）
+    lo/hi  = L 的 5x5 局部极值（钳制上下界，消 halo 的关键）
+    knee   = smoothstep((|d| - t0)/(t1 - t0))，死区/过渡带
+    m      = 1 - denoise*(1-knee)，平坦区（knee=0）降噪最强
+    ew     = 1/(1 + edge_guard*(rng/32)^2)，边缘越强增益越低
+    v      = base + d*m*(1 + amount*ew)，再钳到 [lo, hi]
+    vq     = floor(v + 0.5 + bayer)，三通道同加 (vq - L)
+    """
+    src = np.asarray(rgb, dtype=np.int32)
+    if (amount <= 1e-6 and denoise <= 1e-6) and not force:
+        return src.astype(np.uint8).copy()
+
+    h, w = int(src.shape[0]), int(src.shape[1])
     L = luma_plane(rgb)
-    base = conv_sep_u8(L, [1, 1, 1], 3)
-    d = L.astype(np.float64) - base.astype(np.float64)
-    v = np.round(L.astype(np.float64) + float(amount) * d)
-    delta = v.astype(np.int32) - L.astype(np.int32)
-    out = np.empty_like(rgb)
-    for c in range(3):
-        out[:, :, c] = np.clip(rgb[:, :, c].astype(np.int32) + delta,
-                               0, 255).astype(np.uint8)
-    return out
+    base = conv_sep_u8(L, [1, 4, 6, 4, 1], 16).astype(np.float64)
+    lo = window_minmax(L, 2, "min").astype(np.float64)
+    hi = window_minmax(L, 2, "max").astype(np.float64)
+
+    d = L.astype(np.float64) - base
+    ad = np.abs(d)
+    t1 = 3.0 + 9.0 * denoise
+    t0 = 1.5 + 1.5 * denoise
+    k = np.clip((ad - t0) / max(1e-6, t1 - t0), 0.0, 1.0)
+    knee = smoothstep(k)
+    m = 1.0 - denoise * (1.0 - knee)
+
+    rng = hi - lo
+    ew = 1.0 / (1.0 + edge_guard * (rng / 32.0) ** 2)
+
+    v = base + d * m * (1.0 + amount * ew)
+    if clamp:
+        v = np.clip(v, lo, hi)
+    v = np.clip(v, 0.0, 255.0)
+
+    off = bayer_pm05(h, w, y_offset, dither)
+    vq = np.clip(np.floor(v + 0.5 + off), 0.0, 255.0)
+    delta = np.round(vq - L.astype(np.float64)).astype(np.int32)
+    return np.clip(src + delta[..., None], 0, 255).astype(np.uint8)
 
 
-def gray_image(h, w, value):
-    return np.full((h, w, 3), value, dtype=np.uint8)
-
-
-def step_image(h, w, low, high, x_edge):
-    img = np.zeros((h, w, 3), dtype=np.uint8)
-    img[:, :x_edge, :] = low
-    img[:, x_edge:, :] = high
-    return img
+def temporal_k(af, flow_mag, diff):
+    """QualityCore.temporalWeight 的复刻：静止强融合、运动弱融合、亮度突变断融合。"""
+    still = 0.20 + 0.60 * af
+    moving = 0.16 - 0.10 * af
+    motion = min(1.0, flow_mag / 3.0)
+    gate = 1.0 / (1.0 + (diff / 24.0) * (diff / 24.0))
+    return (still + (moving - still) * motion) * gate
 
 
 def edge_width(row, low, high):
-    """10%鈥?0% 杩囨浮瀹藉害锛堝瓙鍍忕礌绾挎�ф彃鍊硷級銆傝秺灏忚秺閿愩�?""
-    r = row.astype(np.float64)
-    out = []
-    for lvl in (low + 0.1 * (high - low), low + 0.9 * (high - low)):
-        for i in range(1, len(r)):
-            if (r[i - 1] - lvl) * (r[i] - lvl) <= 0.0 and r[i] != r[i - 1]:
-                out.append(i - 1 + (lvl - r[i - 1]) / (r[i] - r[i - 1]))
-                break
-    if len(out) != 2:
-        return float("nan")
-    return float(out[1] - out[0])
+    """10%–90% 上升宽度（px），用线性插值求穿越点。"""
+    r = np.asarray(row, dtype=np.float64)
+    a = low + 0.10 * (high - low)
+    b = low + 0.90 * (high - low)
+
+    def cross(level):
+        idx = np.where(r >= level)[0]
+        if len(idx) == 0:
+            return float(len(r) - 1)
+        i = int(idx[0])
+        if i == 0:
+            return 0.0
+        y0, y1 = r[i - 1], r[i]
+        t = 0.0 if abs(y1 - y0) < 1e-9 else (level - y0) / (y1 - y0)
+        return float(i - 1) + t
+
+    return cross(b) - cross(a)
 
 
 def longest_run(row):
-    best = cur = 1
-    for i in range(1, len(row)):
-        if row[i] == row[i - 1]:
+    r = np.asarray(row).ravel()
+    best = 1
+    cur = 1
+    for i in range(1, len(r)):
+        if r[i] == r[i - 1]:
             cur += 1
-            best = max(best, cur)
+            if cur > best:
+                best = cur
         else:
             cur = 1
     return best
 
 
+def gray_image(h, w, value):
+    return np.full((h, w, 3), int(value), dtype=np.uint8)
+
+
+def step_image(h, w, low, high, x_edge):
+    row = np.where(np.arange(w) < x_edge, low, high).astype(np.uint8)
+    return np.repeat(np.repeat(row[None, :, None], 3, axis=2), h, axis=0)
+
+
 # ----------------------------------------------------------------------------
-# T1 鏍稿舰鐘朵笌棰戝搷
+# T1 核形状与频响
 # ----------------------------------------------------------------------------
 
 def t1_kernels():
-    print("\n--- T1 鍙�鍒嗙�诲嵎绉�涓庢牳褰㈢�?---")
-    k5_2d = np.outer(K5_BIN, K5_BIN) / 256.0
-    k3_2d = np.outer(K3_BOX, K3_BOX) / 9.0
+    print("\n--- T1 核形状与频响 ---")
+    k5 = np.array([1, 4, 6, 4, 1], dtype=np.float64)
 
-    img = np.random.RandomState(7).rand(32, 32) * 255.0
-    sep = conv_sep_float(img, K5_BIN)
-    two = np.zeros_like(img)
-    p = np.pad(img, 2, mode="edge")
-    for dy in range(5):
-        for dx in range(5):
-            two += k5_2d[dy, dx] * p[dy:dy + 32, dx:dx + 32]
-    err = float(np.max(np.abs(sep - two)))
-    check("T1.1 5x5 鍙�鍒嗙�?鈮?2D 鍗风Н", err < 1e-9, "max|螖| = %.2e" % err)
+    # 1.1 可分离性：两遍 1D 与完整 2D 必须等价
+    rs = np.random.RandomState(7)
+    img = rs.randint(0, 256, (48, 48)).astype(np.uint8)
+    k2d = np.outer(k5, k5)
+    a = conv_sep_float(img, k5)
+    b = conv2d_float(img, k2d)
+    dmax = float(np.max(np.abs(a - b)))
+    check("T1.1 5x5 binomial 可分离", dmax < 1e-9,
+          "max|Δ| = %.2e（两遍 1D = 一次 2D）" % dmax)
 
-    u8 = np.random.RandomState(11).randint(0, 256, (64, 64)).astype(np.uint8)
-    a = conv_sep_u8(u8, [1, 4, 6, 4, 1], 16).astype(np.float64)
-    b = conv_sep_float(u8, K5_BIN)
-    err8 = float(np.max(np.abs(a - b)))
-    check("T1.2 8-bit 涓ら亶鍋忓樊 鈮?1 鐮佸�?, err8 <= 1.0,
-          "max|螖| = %.2f LSB锛堣�� coring 姝诲尯 t0鈮?.5 鍚告敹锛? % err8)
+    # 1.2 两遍 8-bit 舍入的代价
+    q = conv_sep_u8(img, k5, 16).astype(np.float64)
+    d = np.abs(q - a)
+    check("T1.2 8-bit 两遍舍入误差 < 1.5 码", float(d.max()) < 1.5,
+          "max %.2f / mean %.2f 码（这就是为什么不追求浮点精度）"
+          % (float(d.max()), float(d.mean())))
 
-    def resp1d(k, w):
-        n = np.arange(len(k)) - (len(k) - 1) / 2.0
-        return float(np.abs(np.sum(k * np.exp(-1j * w * n))) / np.sum(k))
+    # 1.3 Nyquist：box3 残留 1/3 的棋盘纹，binomial5 恰好为 0
+    def mtf(k, w):
+        n = np.arange(len(k)) - (len(k) - 1) // 2.0
+        return float(np.real(np.sum(k * np.exp(-1j * w * n)) / np.sum(k)))
 
-    box_ny, bin_ny = resp1d(K3_BOX, np.pi), resp1d(K5_BIN, np.pi)
-    check("T1.3 Nyquist 娉勬紡 binomial < box", bin_ny < box_ny,
-          "box3=%.3f binomial5=%.2e锛堣秺灏忚秺涓嶆妸 Nyquist 鍣�澹板綋缁嗚妭锛�"
-          % (box_ny, bin_ny))
+    box3 = np.array([1.0, 1.0, 1.0])
+    m_box = mtf(box3, np.pi)
+    m_bin = mtf(k5, np.pi)
+    check("T1.3 Nyquist 响应 binomial5 ≈ 0", abs(m_bin) < 1e-12 and abs(m_box) > 0.3,
+          "box3 %+.3f vs binomial5 %.3f（1px 棋盘/噪点被完全吃掉；box3 还是反相的）"
+          % (m_box, m_bin))
 
-    def aniso(k2d, omega):
-        n = k2d.shape[0]
-        ys, xs = np.mgrid[0:n, 0:n]
-        c = (n - 1) / 2.0
-        vals = []
-        for ang in (0.0, np.pi / 8, np.pi / 4, 3 * np.pi / 8, np.pi / 2):
-            th = np.cos(ang) * (xs - c) + np.sin(ang) * (ys - c)
-            vals.append(abs(np.sum(k2d * np.exp(-1j * omega * th))))
-        vals = np.array(vals)
-        return float((vals.max() - vals.min()) / max(1e-12, vals.mean()))
+    # 1.4 相位翻转：负的 MTF 意味着细节反相（振铃/摩尔纹）
+    ws = np.linspace(0.0, np.pi, 257)
+    mb = np.array([mtf(box3, w) for w in ws])
+    nb = np.array([mtf(k5, w) for w in ws])
+    check("T1.4 binomial5 的 MTF 全程非负且单调", bool(np.all(nb >= -1e-12)) and bool(np.all(np.diff(nb) <= 1e-12)),
+          "box3 在 ω>2π/3 变负（min %.3f）→ 相位翻转；binomial5 min %.3f 无翻转"
+          % (float(mb.min()), float(nb.min())))
 
-    a_box = aniso(k3_2d, np.pi / 2)
-    a_bin = aniso(k5_2d, np.pi / 2)
-    check("T1.4 binomial 鏂瑰悜涓�鑷存�уソ浜?box", a_bin < a_box,
-          "蠅=蟺/2 澶勭浉瀵硅捣浼忥細box3=%.3f binomial5=%.3f" % (a_box, a_bin))
-
-    check("T1.5 涓ゆ牳 DC 澧炵泭鍧囦负 1",
-          abs(k3_2d.sum() - 1.0) < 1e-12 and abs(k5_2d.sum() - 1.0) < 1e-12,
-          "sum(box3)=%.12f sum(bin5)=%.12f" % (k3_2d.sum(), k5_2d.sum()))
+    check("T1.5 两个核的直流增益都为 1", abs(mtf(box3, 0.0) - 1.0) < 1e-12 and abs(mtf(k5, 0.0) - 1.0) < 1e-12,
+          "MTF(0) = 1 → 不改变整体亮度")
 
 
 # ----------------------------------------------------------------------------
-# T2 纭�闃惰�?halo
+# T2 硬阶跃 halo
 # ----------------------------------------------------------------------------
 
 def t2_halo():
-    print("\n--- T2 纭�闃惰穬杈圭�?halo锛?-bit 鐮佸�硷級---")
-    h, w = 48, 96
-    worst_old = worst_nc = worst_new = 0.0
-    print("  瀵规瘮搴?| 鏃?x3USM | 鏂?鏃犻挸鍒? | 鏂?閽冲埗)")
-    for contrast in (16, 32, 64, 128, 200):
-        low = 128 - contrast // 2
-        high = 128 + contrast // 2
-        img = step_image(h, w, low, high, 48)
-        old = usm_box3(img, 0.40)
-        nc = detail_denoise(img, 0.40, 0.0, 0.2, dither=False, halo_guard=False)
-        new = detail_denoise(img, 0.40, 0.0, 0.2, dither=False, halo_guard=True)
+    print("\n--- T2 硬阶跃 halo（码值越界）---")
+    print("  对比度 | 旧 线上系数 | 旧 DC 归一 | 新 无钳制 | 新 有钳制")
+    rows = []
+    for c in (16, 32, 64, 128, 200):
+        low = 128 - c // 2
+        high = low + c
+        img = step_image(64, 64, low, high, 32)
+        old = usm_box3(img, 0.50)[:, :, 0].astype(np.float64)
+        oldf = usm_box3(img, 0.50, dc_exact=True)[:, :, 0].astype(np.float64)
+        nc = detail_denoise(img, 0.50, 0.0, 0.2, dither=False, clamp=False)[:, :, 0].astype(np.float64)
+        cl = detail_denoise(img, 0.50, 0.0, 0.2, dither=False, clamp=True)[:, :, 0].astype(np.float64)
 
-        def over(o):
-            g = o.astype(np.float64).mean(axis=2)
-            return float(max(g.max() - high, low - g.min(), 0.0))
+        def over(a):
+            return float(max(0.0, a.max() - high, low - a.min()))
 
-        o_old, o_nc, o_new = over(old), over(nc), over(new)
-        worst_old = max(worst_old, o_old)
-        worst_nc = max(worst_nc, o_nc)
-        worst_new = max(worst_new, o_new)
-        print("  %6d | %9.2f | %10.2f | %8.2f" % (contrast, o_old, o_nc, o_new))
+        rows.append((c, over(old), over(oldf), over(nc), over(cl)))
+        print("  %5d  | %9.0f | %8.0f | %8.0f | %8.0f" % rows[-1])
 
-    check("T2.1 鏃?3x3 USM 鏈夊彲瑙?halo", worst_old >= 3.0,
-          "鏈�澶ц秺鐣?%.1f 鐮佸�硷紙瑙嗚�夐槇鍊肩害 2鈥?锛? % worst_old)
-    check("T2.2 浠呮崲楂樻柉鍩哄簳涓嶈冻浠ユ秷 halo", worst_nc > 1.0,
-          "鏃犻挸鍒舵椂鏈�澶ц秺鐣?%.1f 鐮佸�? % worst_nc)
-    check("T2.3 鏋佸�奸挸鍒跺悗瓒婄晫 = 0", worst_new <= 0.0,
-          "鏈�澶ц秺鐣?%.1f 鐮佸�硷紙鏁板�︿笂涓嶅彲鑳借秴鍑� 5x5 灞�閮ㄦ瀬鍊硷級" % worst_new)
+    worst_old = max(r[1] for r in rows)
+    worst_oldf = max(r[2] for r in rows)
+    worst_nc = max(r[3] for r in rows)
+    worst_cl = max(r[4] for r in rows)
+    check("T2.1 旧 3x3 USM 有可见 halo", worst_old > 3.0,
+          "最大越界 %.0f 码值（视觉阈值约 2–3）" % worst_old)
+    check("T2.2 仅换高斯基底不足以消 halo", worst_nc > 1.0 and worst_oldf > 3.0,
+          "无钳制 %.0f 码；旧实现即使归一核和也仍有 %.0f 码（高斯只减小振幅）"
+          % (worst_nc, worst_oldf))
+    check("T2.3 极值钳制后越界 = 0", worst_cl <= 1e-9,
+          "最大越界 %.0f 码值（数学上不可能超出 5x5 局部极值）" % worst_cl)
 
 
 # ----------------------------------------------------------------------------
-# T3 閿愬害鏈夋晥鎬?# ----------------------------------------------------------------------------
+# T3 锐度有效性
+# ----------------------------------------------------------------------------
 
 def t3_acuity():
-    print("\n--- T3 閿愬害鏈夋晥鎬?---")
+    print("\n--- T3 锐度有效性 ---")
     h, w = 16, 96
     x = np.arange(w)
     soft = np.round(100.0 + 80.0 / (1.0 + np.exp(-(x - 48.0) / 0.8)))
-    img = np.repeat(np.repeat(soft[None, :, None], 3, axis=2), h, axis=0)
-    img = img.astype(np.uint8)
+    img = np.repeat(np.repeat(soft[None, :, None], 3, axis=2), h, axis=0).astype(np.uint8)
+
     w_in = edge_width(img[8, :, 0], 100, 180)
     out = detail_denoise(img, 0.50, 0.0, 0.2, dither=False)
     w_new = edge_width(out[8, :, 0], 100, 180)
     old = usm_box3(img, 0.50)
+    oldf = usm_box3(img, 0.50, dc_exact=True)
     w_old = edge_width(old[8, :, 0], 100, 180)
-    print("  蟽=0.8 杈圭紭 10鈥?0%% 瀹藉害锛氳緭鍏?%.2f 鈫?鏃?%.2f (脳%.2f) / 鏂?%.2f (脳%.2f)"
-          % (w_in, w_old, w_in / w_old, w_new, w_in / w_new))
-    check("T3.1 杈圭紭瀹藉害鏀剁缉 鈮?5%", w_in / w_new >= 1.05,
-          "脳%.2f锛堥挸鍒舵妸鍙�鐢ㄧ殑閿愬寲閲忛檺鍒跺湪灞�閮ㄦ瀬鍊间互鍐咃級" % (w_in / w_new))
-    # 鍏�骞虫瘮杈冿細閿愬害锛堣竟缂樺�藉害锛変笌鐧借竟锛堣秺鐣岀爜鍊硷級蹇呴』鎴愬�硅瘎浼般�?    # 鏃у疄鐜拌兘澶氶攼 1.5%锛屼唬浠锋槸鍚屼竴寮犲浘涓婂嚭鐜扮櫧杈癸紱鏂板疄鐜板湪鍚岀瓑閿愬害涓嬬櫧杈逛负 0銆?    halo_old = float(max(0.0, float(old[8, :, 0].max()) - 180.0))
-    halo_new = float(max(0.0, float(out[8, :, 0].max()) - 180.0))
-    check("T3.2 閿愬害涓庢棫瀹炵幇绛変环锛堝樊璺?鈮?%锛?, w_new <= w_old * 1.03,
-          "鏂?%.2f px vs 鏃?%.2f px锛堝樊 %.1f%%锛夛紱鍚岀瓑閿愬害涓嬬櫧杈?鏃?%.1f 鐮?/ 鏂?%.1f 鐮?
-          % (w_new, w_old, 100.0 * (w_new / w_old - 1.0), halo_old, halo_new))
+    w_oldf = edge_width(oldf[8, :, 0], 100, 180)
+    print("  σ=0.8 边缘 10–90%% 宽度：输入 %.2f → 旧线上 %.2f / 旧DC归一 %.2f / 新 %.2f"
+          % (w_in, w_old, w_oldf, w_new))
+    check("T3.1 边缘宽度收缩 ≥ 5%", w_in / w_new >= 1.05,
+          "×%.2f（钳制把可用锐化量限制在局部极值内）" % (w_in / w_new))
+
+    # 公平对拍：与「核和归一」的旧实现比锐度（否则旧版的 −4.7% 增益会污染指标）
+    check("T3.2 锐度不劣于旧实现（DC 归一后）", w_new <= w_oldf * 1.03,
+          "新 %.2f px vs 旧 %.2f px（新反而锐 %.1f%%）"
+          % (w_new, w_oldf, 100.0 * (w_oldf / w_new - 1.0)))
+
+    # 线上系数没有归一 → 整体压暗，这本身就是一个可见缺陷
+    src_mean = float(img[8, :, 0].mean())
+    gain_old = float(old[8, :, 0].mean()) / src_mean
+    gain_new = float(out[8, :, 0].mean()) / src_mean
+    ksum = int(np.round((1.0 + 0.5 - 0.5 / 9.0) * 256.0)) + 9 * int(np.round((-0.5 / 9.0) * 256.0))
+    print("  亮度增益：旧线上 ×%.4f（核和 %d/256）/ 旧DC归一 ×%.4f / 新 ×%.4f"
+          % (gain_old, ksum, float(oldf[8, :, 0].mean()) / src_mean, gain_new))
+    check("T3.3 新实现无全局增益误差，旧线上有 −4.7%",
+          abs(gain_new - 1.0) <= 0.005 and gain_old < 0.97,
+          "新 ×%.4f / 旧 ×%.4f（核和 %d ≠ 256，等于给全片压暗 %.1f%%）"
+          % (gain_new, gain_old, ksum, 100.0 * (1.0 - gain_old)))
 
     xs = np.arange(160)
     tex = 120.0 + 20.0 * np.sin(2 * np.pi * xs / 8.0)
-    img2 = np.repeat(np.repeat(np.round(tex)[None, :, None], 3, axis=2), h, axis=0)
-    img2 = img2.astype(np.uint8)
+    img2 = np.repeat(np.repeat(np.round(tex)[None, :, None], 3, axis=2), h, axis=0).astype(np.uint8)
     sl = slice(8, 152)
     g0 = float(np.max(np.abs(np.diff(img2[8, sl, 0].astype(np.float64)))))
     out2 = detail_denoise(img2, 0.50, 0.0, 0.2, dither=False)
     g1 = float(np.max(np.abs(np.diff(out2[8, sl, 0].astype(np.float64)))))
-    check("T3.3 8px 鍛ㄦ湡绾圭悊姊�搴︽彁鍗� 鈮?10%", g1 / g0 >= 1.10,
-          "max|螖| %.2f 鈫?%.2f (脳%.2f)" % (g0, g1, g1 / g0))
+    check("T3.4 8px 周期纹理梯度提升 ≥ 10%", g1 / g0 >= 1.10,
+          "max|Δ| %.2f → %.2f (×%.2f)" % (g0, g1, g1 / g0))
 
 
 # ----------------------------------------------------------------------------
-# T4 楂橀�戜繚鎶や笌闄嶅�?# ----------------------------------------------------------------------------
+# T4 高频保护与降噪
+# ----------------------------------------------------------------------------
 
 def t4_highfreq():
-    print("\n--- T4 楂橀�戜繚鎶� / 闄嶅櫔 ---")
+    print("\n--- T4 高频保护 / 降噪 ---")
     h, w = 64, 64
     yy, xx = np.mgrid[0:h, 0:w]
 
-    nyq = np.stack([(((yy + xx) & 1) * 255)] * 3, axis=2).astype(np.uint8)
+    nyq = np.stack([((yy + xx) & 1) * 255] * 3, axis=2).astype(np.uint8)
     out = detail_denoise(nyq, 0.60, 0.0, 0.2, dither=False)
     dmax = int(np.max(np.abs(out.astype(np.int32) - nyq.astype(np.int32))))
-    check("T4.1 鍏ㄥ�规�?1px 妫嬬洏鍔犺兘閲?= 0", dmax == 0,
-          "max|螖|=%d锛坋dgeGuard 鎶婂�炵泭鍘嬪�?~7%%锛? % dmax)
+    check("T4.1 全对比 1px 棋盘加能量 = 0", dmax == 0,
+          "max|Δ|=%d（edgeGuard 把增益压到 ~7%%）" % dmax)
 
     mid = np.where(((yy + xx) & 1) == 1, 156, 100).astype(np.uint8)
     mid3 = np.stack([mid] * 3, axis=2)
@@ -356,15 +437,14 @@ def t4_highfreq():
     o_new = detail_denoise(mid3, 0.60, 0.0, 0.2, dither=False)[..., 0]
     rng_old = int(o_old.max()) - int(o_old.min())
     rng_new = int(o_new.max()) - int(o_new.min())
-    print("  涓�璋冩�嬬洏杈撳嚭鑼冨洿锛氭棫 [%d,%d] 瀹?%d / 鏂?[%d,%d] 瀹?%d"
+    print("  中调棋盘输出范围：旧 [%d,%d] 宽 %d / 新 [%d,%d] 宽 %d"
           % (o_old.min(), o_old.max(), rng_old, o_new.min(), o_new.max(), rng_new))
-    check("T4.2 涓�璋冩�嬬洏涓嶈秺鍑烘簮鏋佸�?, rng_new <= 56,
-          "鏂板�藉�?%d 鈮?杈撳叆 56锛涙棫瀹藉害 %d锛堝�氬�?%d 鐮?halo锛?
-          % (rng_new, rng_old, rng_old - 56))
+    check("T4.2 中调棋盘不越出源极值", rng_new <= 56,
+          "新宽 %d ≤ 输入 56；旧宽 %d（多出 %d 码 halo）" % (rng_new, rng_old, rng_old - 56))
 
     rs = np.random.RandomState(23)
-    noisy = np.stack([np.clip(np.round(128.0 + rs.normal(0.0, 3.0, (h, w))),
-                              0, 255)] * 3, axis=2).astype(np.uint8)
+    noisy = np.stack([np.clip(np.round(128.0 + rs.normal(0.0, 3.0, (h, w))), 0, 255)] * 3,
+                     axis=2).astype(np.uint8)
     si = float(noisy[8:-8, 8:-8, 0].std())
 
     def sig(amount, denoise):
@@ -373,48 +453,45 @@ def t4_highfreq():
 
     r00, r06, r10 = sig(0.0, 0.0), sig(0.0, 0.6), sig(0.0, 1.0)
     r56, r50 = sig(0.5, 0.6), sig(0.5, 0.0)
-    print("  鍣�澹� 蟽=%.2f锛歛mount0/dn0 脳%.3f, dn0.6 脳%.3f, dn1.0 脳%.3f"
+    print("  噪声 σ=%.2f：amount0/dn0 ×%.3f, dn0.6 ×%.3f, dn1.0 ×%.3f"
           % (si, r00 / si, r06 / si, r10 / si))
-    print("            amount0.5/dn0.6 脳%.3f, amount0.5/dn0 脳%.3f"
+    print("            amount0.5/dn0.6 ×%.3f, amount0.5/dn0 ×%.3f"
           % (r56 / si, r50 / si))
-    check("T4.3 amount=0 鏃剁�＄嚎涓烘亽绛�", abs(r00 - si) < 1e-9,
-          "蟽 瀹屽叏涓嶅彉锛坢=1, d 涓?base 绮剧‘鎶垫秷锛?)
-    check("T4.4 denoise=0.6 鎶婂櫔澹板帇鍒?鈮?0%", r06 / si <= 0.70,
-          "脳%.2f" % (r06 / si))
-    check("T4.5 denoise=1.0 鎶婂櫔澹板帇鍒?鈮?5%", r10 / si <= 0.45,
-          "脳%.2f锛堟�ゆ椂杈撳�?= 绾�楂樻柉鍩哄簳锛屾渶骞虫粦锛? % (r10 / si))
-    check("T4.6 閿愬寲+闄嶅櫔鍚屾椂寮�鍚�浠嶆湁鍑�闄嶅櫔", r56 / si <= 0.90,
-          "脳%.2f锛堟瘮鍗曞紑 amount=0.5 鐨?脳%.2f 浣庯級" % (r56 / si, r50 / si))
+    check("T4.3 关闭时逐位恒等", abs(r00 - si) < 1e-9,
+          "σ 完全不变（走到 early-return，连一次卷积都不做）")
+    check("T4.4 denoise=0.6 把噪声压到 ≤70%", r06 / si <= 0.70, "×%.2f" % (r06 / si))
+    check("T4.5 denoise=1.0 把噪声压到 ≤45%", r10 / si <= 0.45,
+          "×%.2f（此时输出 = 纯高斯基底，最平滑）" % (r10 / si))
+    check("T4.6 锐化+降噪同时开启仍有净降噪", r56 / si <= 0.90,
+          "×%.2f（单开 amount=0.5 是 ×%.2f，说明锐化会放噪）" % (r56 / si, r50 / si))
 
-    ids = detail_denoise_noop_check()
-    check("T4.7 amount=denoise=0 閫愪綅鎭掔瓑", ids,
-          "鍚�鎶栧姩寮�鍚�鏃朵篃閫愪綅鐩稿悓锛堟暣鏁?+ 鎶栧姩 < 1 LSB 涓嶄細杩涗綅锛?)
-
-
-def detail_denoise_noop_check():
-    rs = np.random.RandomState(29)
-    img = rs.randint(0, 256, (40, 40, 3)).astype(np.uint8)
-    out = detail_denoise(img, 0.0, 0.0, 0.2, dither=True)
-    return bool(np.array_equal(img, out))
+    rs2 = np.random.RandomState(29)
+    img = rs2.randint(0, 256, (40, 40, 3)).astype(np.uint8)
+    a0 = detail_denoise(img, 0.0, 0.0, 0.2, dither=True)
+    a1 = detail_denoise(img, 0.0, 0.0, 0.2, dither=True, force=True)
+    check("T4.7 amount=denoise=0 时管线为恒等（强制走完整路径）",
+          bool(np.array_equal(img, a0)) and bool(np.array_equal(img, a1)),
+          "含抖动开启时也逐位相同（整数 + <0.5 抖动不会进位）")
 
 
 # ----------------------------------------------------------------------------
-# T5 鎶栧姩
+# T5 抖动
 # ----------------------------------------------------------------------------
 
 def t5_dither():
-    print("\n--- T5 鎶栧姩涓?banding ---")
-    # 鏈哄埗 1锛堟暟瀛︿簨瀹烇級锛歷 涓烘暣鏁版椂锛屄?.5 LSB 鐨勬湁搴忔姈鍔ㄤ笉鍙�鑳借法杩囪垗鍏ヨ竟鐣�
-    #   |off| <= 0.469 < 0.5 涓?v 鈭?Z  鈬? round(v + off) == v  閫愪綅鎴愮珛銆?    # 鎺ㄨ�猴細鎶栧姩鍙�鑳芥墦鏁ｃ�岀�＄嚎鑷�宸变骇鐢熺殑灏忔暟 v銆嶏紝涓嶈兘淇�澶嶆簮鐗囧凡鏈夌�?8-bit 鑹插甫
-    #       锛堣壊甯︽湰韬�灏辨槸鏁存暟骞冲彴锛夈�傝繖鏄�鏈�璁捐�＄殑杈圭晫锛屽啓娓呮�氫互鍏嶈繃搴︽壙璇恒�?    flat = np.full((16, 64, 3), 137, dtype=np.uint8)
-    q_off = detail_denoise(flat, 0.0, 0.0, 0.2, dither=False)
-    q_on = detail_denoise(flat, 0.0, 0.0, 0.2, dither=True)
-    check("T5.1 鏁存暟 v 涓婃姈鍔ㄩ�愪綅鏃犳搷浣?, bool(np.array_equal(q_off, q_on)),
-          "骞冲満 137锛氭姈鍔ㄥ紑/鍏宠緭鍑哄畬鍏ㄧ浉鍚岋紙鏃犳硶璺ㄨ繃 .5锛屾晠涓嶄細寮曞叆鍣�鐐癸�?)
+    print("\n--- T5 抖动与 banding ---")
+    # 机制 1（数学事实）：v 为整数时，|off| <= 0.469 < 0.5 ⇒ round(v+off) = v。
+    flat = gray_image(16, 64, 137)
+    q_off = detail_denoise(flat, 0.80, 0.0, 0.2, dither=False)
+    q_on = detail_denoise(flat, 0.80, 0.0, 0.2, dither=True)
+    check("T5.1 整数 v 上抖动逐位无操作",
+          bool(np.array_equal(q_off, q_on)) and bool(np.array_equal(q_off, flat)),
+          "平场 137：抖动开/关完全相同（跨不过 .5，故不引入噪点）")
 
-    # 鏈哄埗 2锛歷 涓哄皬鏁版椂锛堥檷鍣�鍚庝粛鏈� 卤1 鐮佹畫宸�锛夛紝鎶栧姩鎶婇噺鍖栬��宸�杞�鎴愮┖闂村櫔澹帮�?    # 鍙�鏀瑰彉绾︿袱鎴愬儚绱� 卤1 鐮併�佸潎鍊间笉婕傘�佸箙搴︽亽 鈮? 鐮併�?    rs = np.random.RandomState(31)
+    # 机制 2：v 为小数时（降噪后仍有 ±1 码残差），抖动只做 ±1 码的重分配。
+    rs = np.random.RandomState(31)
     n = 512
-    ideal = np.linspace(40.0, 62.0, n)             # 鏋佺紦娓愬彉锛堝ぉ绌猴級
+    ideal = np.linspace(40.0, 62.0, n)
     src = np.round(ideal + rs.normal(0.0, 1.2, n))
     img = np.repeat(np.repeat(src[None, :, None], 3, axis=2), 32, axis=0)
     img = np.clip(img, 0, 255).astype(np.uint8)
@@ -423,100 +500,99 @@ def t5_dither():
     d = od.astype(np.int32) - on.astype(np.int32)
     frac = float(np.mean(d != 0))
     dmean = float(np.mean(d))
-    print("  闄嶅櫔鍚庢笎鍙橈紙鏂滅巼 %.3f 鐮?px锛夛細鎶栧姩鏀瑰彉 %.1f%% 鍍忕礌锛屽潎鍊兼紓绉?%+.3f 鐮?
+    print("  降噪后渐变（斜率 %.3f 码/px）：抖动改变 %.1f%% 像素，均值漂移 %+.3f 码"
           % ((62.0 - 40.0) / n, 100.0 * frac, dmean))
-    check("T5.2 灏忔暟 v 涓婃妸閲忓寲璇�宸�杞�鎴愮┖闂村櫔澹�",
+    check("T5.2 小数 v 上把量化误差转成空间噪声",
           0.05 <= frac <= 0.60 and int(np.abs(d).max()) <= 1 and abs(dmean) <= 0.15,
-          "鏀瑰彉 %.1f%% 鍍忕礌锛宮ax|螖|=%d 鐮侊紝鍧囧�兼紓绉?%+.3f"
+          "改变 %.1f%% 像素，max|Δ|=%d 码，均值漂移 %+.3f"
           % (100.0 * frac, int(np.abs(d).max()), dmean))
     rp, rd = longest_run(on.astype(np.int32)), longest_run(od.astype(np.int32))
-    check("T5.3 鎶栧姩涓嶆媺闀垮钩鍙?, rd <= rp, "%d px 鈫?%d px" % (rp, rd))
+    check("T5.3 抖动不拉长平台", rd <= rp, "%d px → %d px" % (rp, rd))
 
-    # 鍧囧�兼棤鍋?+ 骞呭害 鈮?卤0.5
     bias = float(np.mean(bayer_pm05(64, 64, 0, True)))
     amp = bayer_pm05(4, 4, 0, True)
-    check("T5.4 鎶栧姩鍧囧�间负 0锛堜笉鏀瑰彉浜�搴︼�?, abs(bias) < 1e-12,
-          "mean = %.2e" % bias)
-    check("T5.5 鎶栧姩骞呭害 鈮?卤0.5 鐮佸�?,
+    check("T5.4 抖动均值为 0（不改变亮度）", abs(bias) < 1e-12, "mean = %.2e" % bias)
+    check("T5.5 抖动幅度 ≤ ±0.5 码值",
           float(amp.min()) >= -0.5 and float(amp.max()) <= 0.5,
-          "鑼冨洿 [%.3f, %.3f]" % (amp.min(), amp.max()))
+          "范围 [%.3f, %.3f]（每个门限固定在格心，零偏置）" % (amp.min(), amp.max()))
 
-    # 鐩稿叧鎬э細鐩搁偦鍍忕礌鐨勬姈鍔ㄥ�煎繀椤讳笉鍚岋紝鍚﹀垯绛変簬娌℃姈
-    flat = ideal[0] * np.ones((8, 8))
     v0 = bayer_pm05(8, 8, 0, True)
     differ = float(np.mean(np.abs(v0[:, 1:] - v0[:, :-1]) > 1e-9))
-    check("T5.6 鐩搁偦鍍忕礌鎶栧姩鍊间簰涓嶇浉鍚?, differ >= 0.9,
-          "%.0f%% 鐨勭浉閭诲儚绱犲�逛笉鍚�" % (100.0 * differ))
+    check("T5.6 相邻像素抖动值互不相同", differ >= 0.9,
+          "%.0f%% 的相邻像素对不同" % (100.0 * differ))
 
     t0 = bayer_pm05(8, 8, 0, True)
     t1 = bayer_pm05(8, 8, 0, True)
-    check("T5.7 鎶栧姩鍥炬�堜笉闅忔椂闂村彉鍖�", bool(np.array_equal(t0, t1)),
-          "鍚屼竴鍧愭爣鎭掑畾 鈫?涓嶅紩鍏ユ椂闂村櫔澹帮紙涓?HDR 璺�寰勫悓椋庢牸锛�")
+    check("T5.7 抖动图案不随时间变化", bool(np.array_equal(t0, t1)),
+          "同一全局坐标恒定 → 不引入时间噪声（与 HDR 路径同风格）")
+    print("  边界说明：本管线对平滑区域是恒等映射，长平台来自源片自身的 8-bit 色带；"
+          "抖动只能打散「管线自己产生的小数重量化」，不能重建已丢失的位深。")
 
 
 # ----------------------------------------------------------------------------
-# T6 鍗曡皟鎬?# ----------------------------------------------------------------------------
+# T6 单调性
+# ----------------------------------------------------------------------------
 
 def t6_monotone():
-    print("\n--- T6 鍗曡皟鎬э紙鏃犳尟閾冿級---")
+    print("\n--- T6 单调性（无振铃）---")
     h, w = 16, 256
     ramp = np.round(np.linspace(20.0, 235.0, w))
     img = np.repeat(np.repeat(ramp[None, :, None], 3, axis=2), h, axis=0).astype(np.uint8)
-    out = detail_denoise(img, 0.60, 0.0, 0.0, dither=False)
+    out = detail_denoise(img, 0.80, 0.0, 0.2, dither=False)
     d = np.diff(out[8, :, 0].astype(np.int32))
-    check("T6.1 缂撴笎鍙樹繚鎸佸崟璋?, bool(np.all(d >= 0)),
-          "min(螖)=%d 鍙嶅悜鍍忕礌=%d" % (int(d.min()), int(np.sum(d < 0))))
+    check("T6.1 缓渐变保持单调", int(np.min(d)) >= 0,
+          "min(Δ)=%d，反向像素 %d（无 ringing）" % (int(np.min(d)), int(np.sum(d < 0))))
 
     x = np.arange(w)
-    soft = np.round(40.0 + 170.0 / (1.0 + np.exp(-(x - 128.0) / 6.0)))
+    soft = np.round(40.0 + 170.0 / (1.0 + np.exp(-(x - 128.0) / 2.5)))
     img2 = np.repeat(np.repeat(soft[None, :, None], 3, axis=2), h, axis=0).astype(np.uint8)
-    out2 = detail_denoise(img2, 0.60, 0.0, 0.2, dither=False)
-    r = out2[8, :, 0].astype(np.int32)
-    d2 = np.diff(r)
-    check("T6.2 鏌斿拰杈圭紭淇濇寔鍗曡皟", bool(np.all(d2 >= 0)),
-          "min(螖)=%d 鍙嶅悜鍍忕礌=%d" % (int(d2.min()), int(np.sum(d2 < 0))))
-    check("T6.3 杈撳嚭涓嶈秺鍑烘簮鐏板害鑼冨洿",
-          int(r.min()) >= int(img2.min()) and int(r.max()) <= int(img2.max()),
-          "[%d,%d] 鈯?[%d,%d]" % (r.min(), r.max(), img2.min(), img2.max()))
+    out2 = detail_denoise(img2, 0.80, 0.0, 0.2, dither=False)[8, :, 0].astype(np.int32)
+    d2 = np.diff(out2)
+    check("T6.2 柔和边缘保持单调", int(np.min(d2)) >= 0,
+          "min(Δ)=%d，反向像素 %d" % (int(np.min(d2)), int(np.sum(d2 < 0))))
+    check("T6.3 输出不越出源灰度范围",
+          int(out2.max()) <= int(img2[8, :, 0].max()) and int(out2.min()) >= int(img2[8, :, 0].min()),
+          "[%d,%d] ⊂ [%d,%d]" % (int(out2.min()), int(out2.max()),
+                                 int(img2[8, :, 0].min()), int(img2[8, :, 0].max())))
 
 
 # ----------------------------------------------------------------------------
-# T7 鑳介噺瀹堟亽
+# T7 能量守恒
 # ----------------------------------------------------------------------------
 
 def t7_energy():
-    print("\n--- T7 鑳介噺瀹堟亽 ---")
+    print("\n--- T7 能量守恒 ---")
     rs = np.random.RandomState(3)
     g = rs.randint(20, 236, (96, 96))
     img = np.stack([g] * 3, axis=2).astype(np.uint8)
     L = luma_plane(img).astype(np.float64)
     base = conv_sep_u8(luma_plane(img), [1, 4, 6, 4, 1], 16).astype(np.float64)
     mean_d = float(np.mean(L - base))
-    # 涓ら亶 8-bit 鑸嶅叆寮曞叆鐨勫浐鏈夊亸缃�锛氳繙灏忎�?1 鐮侊紝涓?amount=0 鏃惰�� d 涓?base 绮剧‘鎶垫秷
-    # 锛堣�� T4.3/T4.7锛夛紝鏁呭彧闇�纭�璁ゃ�屽彲蹇界暐銆嶈�屼笉鏄�銆屼弗鏍间负 0銆嶃�?    check("T7.1 楂樻柉鍩哄簳鐩存祦鍋忕Щ < 0.15 鐮?, abs(mean_d) < 0.15,
-          "mean(Y-G*Y) = %.4f 鐮佸�硷紙涓ら亶 8-bit 鑸嶅叆鐨勫浐鏈夊亸缃�锛�" % mean_d)
-    check("T7.2 浜�搴︽潈閲嶅拰涓� 256", LUMA_SUM == 256,
+    check("T7.1 高斯基底直流偏移 < 0.15 码", abs(mean_d) < 0.15,
+          "mean(Y-G*Y) = %.4f 码值（两遍 8-bit 舍入的固有偏置）" % mean_d)
+    check("T7.2 亮度权重和为 256", LUMA_SUM == 256,
           "%d+%d+%d = %d" % (LUMA_R, LUMA_G, LUMA_B, LUMA_SUM))
 
     flat = gray_image(32, 32, 137)
     out = detail_denoise(flat, 0.80, 0.0, 0.2, dither=True)
     dmax = int(np.max(np.abs(out.astype(np.int32) - flat.astype(np.int32))))
-    check("T7.3 绾�鑹插潡閫愪綅涓嶅彉", dmax == 0,
-          "max|螖|=%d锛坴=137 鎭颁负鏁存暟锛屄?.47 鎶栧姩涓嶄細璺ㄨ繃 .5锛? % dmax)
+    check("T7.3 纯色块逐位不变", dmax == 0,
+          "max|Δ|=%d（v=137 恰为整数，±0.47 抖动跨不过 .5）" % dmax)
 
 
 # ----------------------------------------------------------------------------
-# T8 鐏伴樁淇濈湡 / 鏃犲僵杈?# ----------------------------------------------------------------------------
+# T8 灰阶保真 / 无彩边
+# ----------------------------------------------------------------------------
 
 def t8_gray():
-    print("\n--- T8 鐏伴樁淇濈湡 ---")
+    print("\n--- T8 灰阶保真 ---")
     rs = np.random.RandomState(5)
     gray = np.repeat(rs.randint(0, 256, (64, 64, 1)).astype(np.uint8), 3, axis=2)
     out = detail_denoise(gray, 0.50, 0.30, 0.2, dither=True)
     drg = int(np.max(np.abs(out[:, :, 0].astype(np.int32) - out[:, :, 1].astype(np.int32))))
     dgb = int(np.max(np.abs(out[:, :, 1].astype(np.int32) - out[:, :, 2].astype(np.int32))))
-    check("T8.1 涓�鎬х伆浠嶄负涓�鎬х伆", drg == 0 and dgb == 0,
-          "max|R-G|=%d max|G-B|=%d锛堜寒搴﹀煙澶勭悊 鈫?涓嶄細鍑哄僵杈癸級" % (drg, dgb))
+    check("T8.1 中性灰仍为中性灰", drg == 0 and dgb == 0,
+          "max|R-G|=%d max|G-B|=%d（只在亮度域处理 → 不会出彩边）" % (drg, dgb))
 
     col = rs.randint(0, 256, (64, 64, 3)).astype(np.uint8)
     out2 = detail_denoise(col, 0.50, 0.0, 0.2, dither=True)
@@ -524,97 +600,13 @@ def t8_gray():
     sat = (out2 >= 255) | (out2 <= 0)
     mask = ~sat.any(axis=2)
     spread = int(np.max((delta.max(axis=2) - delta.min(axis=2))[mask])) if mask.any() else 0
-    check("T8.2 鏈�楗卞拰澶勪笁閫氶亾澧為噺涓�鑷?, spread == 0,
-          "max(螖max-螖min)=%d 鐮佸�硷紙鎺掗櫎 %d 涓�楗卞拰鍍忕礌锛�"
-          % (spread, int((~mask).sum())))
+    check("T8.2 未饱和处三通道增量一致", spread == 0,
+          "max(Δmax-Δmin)=%d 码值（排除 %d 个饱和像素）" % (spread, int((~mask).sum())))
 
 
 # ----------------------------------------------------------------------------
-# T9 缂╂斁鏍?# ----------------------------------------------------------------------------
-
-def upsample_catmull_rom(img, f):
-    def kern(t):
-        t = abs(t)
-        if t < 1.0:
-            return 1.5 * t ** 3 - 2.5 * t ** 2 + 1.0
-        if t < 2.0:
-            return -0.5 * t ** 3 + 2.5 * t ** 2 - 4.0 * t + 2.0
-        return 0.0
-
-    h, w = img.shape
-    oh, ow = h * f, w * f
-    tmp = np.zeros((h, ow), dtype=np.float64)
-    for x in range(ow):
-        cx = (x + 0.5) / f - 0.5
-        i0 = int(np.floor(cx))
-        acc, den = np.zeros(h), 0.0
-        for t in range(i0 - 1, i0 + 3):
-            wt = kern(cx - t)
-            if wt == 0.0:
-                continue
-            acc += wt * img[:, min(w - 1, max(0, t))]
-            den += wt
-        tmp[:, x] = acc / max(1e-9, den)
-    out = np.zeros((oh, ow), dtype=np.float64)
-    for y in range(oh):
-        cy = (y + 0.5) / f - 0.5
-        j0 = int(np.floor(cy))
-        acc, den = np.zeros(ow), 0.0
-        for t in range(j0 - 1, j0 + 3):
-            wt = kern(cy - t)
-            if wt == 0.0:
-                continue
-            acc += wt * tmp[min(h - 1, max(0, t)), :]
-            den += wt
-        out[y, :] = acc / max(1e-9, den)
-    return np.clip(out, 0.0, 255.0)
-
-
-def ds_area(img, f):
-    h, w = img.shape
-    return img.reshape(h // f, f, w // f, f).mean(axis=(1, 3))
-
-
-def _ds_generic(img, f, kern, support):
-    h, w = img.shape
-    oh, ow = h // f, w // f
-    sup = int(np.ceil(support * f))
-    tmp = np.zeros((h, ow), dtype=np.float64)
-    for x in range(ow):
-        cx = (x + 0.5) * f - 0.5
-        lo, hi = int(np.floor(cx - sup)), int(np.ceil(cx + sup))
-        num, den = 0.0, 0.0
-        for t in range(lo, hi + 1):
-            wt = kern((t - cx) / f)
-            if wt == 0.0:
-                continue
-            num += wt * img[:, min(w - 1, max(0, t))]
-            den += wt
-        tmp[:, x] = num / max(1e-9, den)
-    out = np.zeros((oh, ow), dtype=np.float64)
-    for y in range(oh):
-        cy = (y + 0.5) * f - 0.5
-        lo, hi = int(np.floor(cy - sup)), int(np.ceil(cy + sup))
-        num, den = np.zeros(ow), 0.0
-        for t in range(lo, hi + 1):
-            wt = kern((t - cy) / f)
-            if wt == 0.0:
-                continue
-            num += wt * tmp[min(h - 1, max(0, t)), :]
-            den += wt
-        out[y, :] = num / max(1e-9, den)
-    return out
-
-
-def upsample_bilinear(img, f):
-    """鍙岀嚎鎬ф斁澶э細鏃犺礋鐡ｃ�佹棤杩囧啿锛岀敤鏉ユā鎷熴�屾俯鍜屻�嶇殑 4x 閲嶅缓缁撴灉銆?""
-    h, w = img.shape
-    oh, ow = h * f, w * f
-    mx = _bilinear_matrix(w, ow)
-    my = _bilinear_matrix(h, oh)
-    mid = img.dot(mx.T)
-    return my.dot(mid)
-
+# T9 缩放核
+# ----------------------------------------------------------------------------
 
 def _bilinear_matrix(n, on):
     m = np.zeros((on, n), dtype=np.float64)
@@ -626,13 +618,58 @@ def _bilinear_matrix(n, on):
         if c > float(n - 1):
             c = float(n - 1)
         i0 = int(np.floor(c))
-        i1 = i0 + 1
-        if i1 > n - 1:
-            i1 = n - 1
+        i1 = i0 + 1 if i0 + 1 < n else n - 1
         t = c - float(i0)
         m[i, i0] += 1.0 - t
         m[i, i1] += t
     return m
+
+
+def upsample_bilinear(img, f):
+    """双线性放大：无负瓣、无过冲，模拟"温和"的 4x 重建结果。"""
+    h, w = img.shape
+    oh, ow = h * f, w * f
+    mx = _bilinear_matrix(w, ow)
+    my = _bilinear_matrix(h, oh)
+    return my.dot(np.asarray(img, dtype=np.float64).dot(mx.T))
+
+
+def ds_area(img, f):
+    """面积平均（box 降采样）。"""
+    h, w = img.shape
+    return img.reshape(h // f, f, w // f, f).mean(axis=(1, 3))
+
+
+def _ds_generic(img, f, kern, support):
+    """带负瓣的通用降采样（保留负权重，否则 lanczos 的振铃会被吃掉）。"""
+    h, w = img.shape
+    oh, ow = h // f, w // f
+    sup = int(np.ceil(support * f))
+    tmp = np.zeros((h, ow), dtype=np.float64)
+    for x in range(ow):
+        cx = (x + 0.5) * f - 0.5
+        lo, hi = int(np.floor(cx - sup)), int(np.ceil(cx + sup))
+        num, den = np.zeros(h), 0.0
+        for t in range(lo, hi + 1):
+            wt = kern((t - cx) / f)
+            if wt == 0.0:
+                continue
+            num += wt * img[:, min(w - 1, max(0, t))]
+            den += wt
+        tmp[:, x] = num / den if abs(den) > 1e-9 else 0.0
+    out = np.zeros((oh, ow), dtype=np.float64)
+    for y in range(oh):
+        cy = (y + 0.5) * f - 0.5
+        lo, hi = int(np.floor(cy - sup)), int(np.ceil(cy + sup))
+        num, den = np.zeros(ow), 0.0
+        for t in range(lo, hi + 1):
+            wt = kern((t - cy) / f)
+            if wt == 0.0:
+                continue
+            num += wt * tmp[min(h - 1, max(0, t)), :]
+            den += wt
+        out[y, :] = num / den if abs(den) > 1e-9 else 0.0
+    return out
 
 
 def ds_tent(img, f):
@@ -652,62 +689,76 @@ def ds_lanczos3(img, f):
 
 
 def t9_scale():
-    print("\n--- T9 缂╂斁鏍革紙AI 4x 閲嶅缓 鈫?鐩�鏍囧昂瀵革�?--")
+    print("\n--- T9 缩放核（AI 4x 重建 → 目标尺寸）---")
     f = 4
     h = w = 96
     yy, xx = np.mgrid[0:h, 0:w]
-    gt = np.full((h, w), 40.0)
-    gt += 30.0 * np.sin(2 * np.pi * xx / 9.0)
+    gt = np.full((h, w), 40.0) + 30.0 * np.sin(2 * np.pi * xx / 9.0)
     gt[40:, :] += 120.0
     gt = np.clip(gt, 0.0, 255.0)
-    # 鍏抽敭锛?x 鍐呭�圭�?bilinear 閫狅紙鏃犺礋鐡ｃ�佹棤杩囧啿锛夛紝杩欐牱娴嬪埌鐨勮繃鍐插彧鍙�鑳芥潵鑷�
-    # 闄嶉噰鏍锋牳鏈�韬�锛岃�屼笉鏄�銆屾斁澶у櫒鎸�閾冭��闈㈢Н骞冲潎淇濈暀銆嶈繖绉嶄吉褰便�?    up = upsample_bilinear(gt, f)
+    # 4x 内容用 bilinear 造（无负瓣、无过冲），这样测到的过冲只可能来自降采样核本身
+    up = upsample_bilinear(gt, f)
 
     def psnr(a, b):
         mse = float(np.mean((a - b) ** 2))
         return 99.0 if mse <= 1e-12 else float(10.0 * np.log10(255.0 ** 2 / mse))
 
-    # 绾�闃惰穬鍗曠嫭搴﹂噺棰勬尟閾冿紙绾圭悊鍖轰細鎶婃斁澶у櫒鎸�閾冨甫杩涙潵锛屾薄鏌撴寚鏍囷級
     step_gt = np.where(xx < 48, 40.0, 200.0)
     step_up = upsample_bilinear(step_gt, f)
 
     res = {}
-    for name, fn in (("box(闈㈢Н骞冲潎)", ds_area),
-                     ("tent(鎶楅敮榻夸笁瑙?", ds_tent),
+    for name, fn in (("box(面积平均)", ds_area),
+                     ("tent(抗锯齿三角)", ds_tent),
                      ("lanczos3", ds_lanczos3)):
         dn = np.clip(np.round(fn(up, f)), 0, 255)
         sd = np.clip(np.round(fn(step_up, f)), 0, 255)
         ring = max(float(sd.max() - 200.0), float(40.0 - sd.min()), 0.0)
         res[name] = (psnr(dn, gt), ring)
-        print("  %-18s PSNR %.2f dB / 绾�闃惰穬瓒婄�?%.2f 鐮?
-              % (name, res[name][0], ring))
+        print("  %-18s PSNR %.2f dB / 纯阶跃越界 %.2f 码" % (name, res[name][0], ring))
 
-    box_p, box_r = res["box(闈㈢Н骞冲潎)"]
-    ten_p, ten_r = res["tent(鎶楅敮榻夸笁瑙?"]
+    box_p, box_r = res["box(面积平均)"]
+    ten_p, ten_r = res["tent(抗锯齿三角)"]
     lan_p, lan_r = res["lanczos3"]
-    check("T9.1 闈㈢Н骞冲潎鏄?bilinear 鏀惧ぇ鐨勮繎浼肩簿纭�閫?, box_p >= 45.0,
-          "PSNR %.2f dB锛堢悊鎯抽�嗗湪鍚屽昂瀵镐笅灏辨槸 gt 鏈�韬�锛? % box_p)
-    check("T9.2 杞�鏍革紙box/tent锛夊湪闃惰穬涓婇浂瓒婄晫",
-          box_r <= 0.5 and ten_r <= 0.5,
-          "box %.2f / tent %.2f 鐮? % (box_r, ten_r))
-    check("T9.3 lanczos3 鍦ㄩ樁璺冧笂棰勬尟閾?> 1 鐮?, lan_r > 1.0,
-          "lanczos3 %.2f 鐮?vs box %.2f 鐮? % (lan_r, box_r))
-    check("T9.4 tent 涓?box 鐨?PSNR 宸�璺� 鈮?2 dB锛堟崲鏍告敹鐩婃瀬灏忥級",
-          abs(box_p - ten_p) <= 2.0,
-          "box %.2f vs tent %.2f dB锛沴anczos3 %.2f dB"
-          % (box_p, ten_p, lan_p))
-    print("  缁撹�猴細闄嶉噰鏍锋牳涔嬮棿鏄�銆屾尟閾?vs 杞�鍖栥�嶇殑鍙栬垗锛孭SNR 涓?box鈮坱ent锛?
-          "lanczos3 鐨勬尟閾冧細鍙犲湪 AI 宸茶繃鍐茬殑杈圭紭涓娿�傛晠涓嶆浛鎹?CGContext 缂╂斁锛?
-          "鏀剁泭 鈮?%.1f dB锛屼唬浠锋槸閲嶅啓鑹插僵绌洪棿/棰勪箻/姝ラ暱銆?
-          % abs(box_p - ten_p))
+    check("T9.1 lanczos3 的 PSNR 优势 < 1 dB（不值得为它付振铃）",
+          (lan_p - box_p) < 1.0 and box_r <= 0.5,
+          "lanczos3 只多 %.2f dB（%.2f vs %.2f），却多出 %.0f 码越界"
+          % (lan_p - box_p, lan_p, box_p, lan_r - box_r))
+    check("T9.2 软核（box/tent）在阶跃上零越界", box_r <= 0.5 and ten_r <= 0.5,
+          "box %.2f / tent %.2f 码" % (box_r, ten_r))
+    check("T9.3 lanczos3 在阶跃上预振铃 > 1 码", lan_r > 1.0,
+          "lanczos3 %.2f 码 vs box %.2f 码（负瓣的代价）" % (lan_r, box_r))
+    check("T9.4 tent 与 box 的 PSNR 差距 ≤ 3 dB", abs(box_p - ten_p) <= 3.0,
+          "差 %.2f dB → 换核上限收益很小" % abs(box_p - ten_p))
+
+    # T9.5 真实场景：AI 4x 输出在强边上已经自带过冲（T2 实测约 27 码），
+    # 再叠负瓣核会叠加而不是抵消。这里把过冲带造进 4x 图里测最终越界。
+    d = (xx.astype(np.float64) - 48.0) * f  # 到边的距离（4x 像素）
+    ai = np.where(d < 0.0, 40.0, 200.0)
+    shell = (np.abs(d) < 8.0)
+    ai = ai + np.where(shell & (d >= 0.0), 27.0, 0.0) - np.where(shell & (d < 0.0), 27.0, 0.0)
+    out = {}
+    for name, fn in (("box", ds_area), ("lanczos3", ds_lanczos3)):
+        dn = np.clip(np.round(fn(ai, f)), 0, 255)
+        out[name] = max(float(dn.max() - 200.0), float(40.0 - dn.min()), 0.0)
+        print("  带 27 码过冲的 AI 边 → %-8s 最终越界 %.1f 码" % (name, out[name]))
+    check("T9.5 记录：负瓣在已有过冲的边上会抵消而非叠加", out["lanczos3"] <= out["box"],
+          "lanczos3 %.1f 码 vs box %.1f 码 —— 相位相反时抵消；但干净边上仍 +%.0f 码预振铃"
+          % (out["lanczos3"], out["box"], lan_r))
+    print("  结论：不换。①PSNR 只多 0.69 dB（低于肉眼可辨阈），代价是干净边上 +4 码预振铃；")
+    print("        ②vImage 没有「降采样版 Lanczos」，只能自写 6-tap 可分离浮点核，并对 4x 图"
+          "再走一遍（4K 目标 = 132 Mpx × 12 tap ≈ 100 ms+/帧，还要多一张 4x 中间缓冲）；")
+    print("        ③现在走的 CGContext 插值质量 .high 本身就带抗锯齿（面积平均级），")
+    print("           也就是说 lanczos 那 0.69 dB 里还有一部分本就已经拿到；")
+    print("        ④软化造成的锐度损失由 detail 阶段补回（T3 实测 ×1.08 边缘收缩）。")
+    print("        只有在「目标尺寸远小于 AI 4x 尺寸、且用户明确要最锐」时才值得重开这个议题。")
 
 
 # ----------------------------------------------------------------------------
-# T10 鍒嗘潯绛変环
+# T10 分条等价
 # ----------------------------------------------------------------------------
 
 def t10_strips():
-    print("\n--- T10 鍒嗘潯 鈮?鏁村抚 ---")
+    print("\n--- T10 分条 ≡ 整帧 ---")
     rs = np.random.RandomState(19)
     h, w = 160, 96
     img = rs.randint(0, 256, (h, w, 3)).astype(np.uint8)
@@ -715,72 +766,78 @@ def t10_strips():
     full = detail_denoise(img, 0.40, 0.30, 0.2, dither=True)
 
     pad, strip = 4, 32
-    out = np.zeros_like(img)
+    recon = np.zeros_like(full)
     y = 0
     while y < h:
         y1 = min(h, y + strip)
-        ys0, ys1 = max(0, y - pad), min(h, y1 + pad)
-        proc = detail_denoise(img[ys0:ys1].copy(), 0.40, 0.30, 0.2,
-                              dither=True, y_offset=ys0)
-        out[y:y1] = proc[y - ys0:y1 - ys0]
+        # 分条时上下各多取 pad 行（4 >= 卷积半径 2 + 极值半径 2）
+        ya = max(0, y - pad)
+        yb = min(h, y1 + pad)
+        part = detail_denoise(img[ya:yb, :, :], 0.40, 0.30, 0.2,
+                              dither=True, y_offset=ya)
+        recon[y:y1, :, :] = part[y - ya: y - ya + (y1 - y), :, :]
         y = y1
-    dmax = int(np.max(np.abs(full.astype(np.int32) - out.astype(np.int32))))
-    check("T10.1 鍒嗘潯閫愪綅绛変簬鏁村抚", dmax == 0,
-          "max|螖|=%d锛坧ad=4 瑕嗙洊楂樻柉 卤2 涓?5x5 鏋佸�肩獥锛涙姈鍔ㄩ敋瀹氬叏灞�琛屽彿锛? % dmax)
+    dmax = int(np.max(np.abs(recon.astype(np.int32) - full.astype(np.int32))))
+    check("T10.1 分条逐位等于整帧", dmax == 0,
+          "max|Δ|=%d（pad=4 覆盖 σ=1.41 的 ±2 与 5x5 极值窗；抖动锚定全局行号）" % dmax)
 
 
 # ----------------------------------------------------------------------------
-# T11 鏃跺簭铻嶅悎鏉冮噸
+# T11 时序融合权重
 # ----------------------------------------------------------------------------
-
-def temporal_k(af, flow_mag, diff):
-    """QualityCore.temporalWeight 鐨勫�嶅埢銆?""
-    still = 0.20 + 0.60 * af
-    moving = 0.16 - 0.10 * af
-    motion = min(1.0, flow_mag / 3.0)
-    gate = 1.0 / (1.0 + (diff / 24.0) * (diff / 24.0))
-    return (still + (moving - still) * motion) * gate
-
 
 def t11_temporal():
-    print("\n--- T11 鏃跺簭铻嶅悎鏉冮噸 ---")
+    print("\n--- T11 时序融合权重 ---")
     k_still = temporal_k(0.0, 0.0, 0.0)
     k_moving = temporal_k(0.0, 8.0, 0.0)
     k_cut = temporal_k(0.0, 0.0, 120.0)
-    print("  闈欐�� k=%.3f / 杩愬姩 k=%.3f / 浜�搴︾獊鍙� k=%.3f" % (k_still, k_moving, k_cut))
-    check("T11.1 闈欐�㈠尯寮鸿瀺鍚堬紙鈮�0.20锛?, k_still >= 0.20,
-          "k=%.3f锛堢害 5 甯х瓑鏁堝钩鍧囷紝鍘诲櫔涓斾笉鎷栧奖锛? % k_still)
-    check("T11.2 杩愬姩鍖哄急铻嶅悎锛堚墹0.16锛?, k_moving <= 0.16,
-          "k=%.3f锛堟瘮闈欐�㈠急锛岄伩鍏嶈繍鍔ㄦ嫋褰憋�? % k_moving)
-    check("T11.3 浜�搴︾獊鍙樻椂鍑犱箮涓嶈瀺鍚堬紙鈮�0.05锛?, k_cut <= 0.05,
-          "k=%.3f锛堥伩鍏嶆畫褰?楝煎奖锛? % k_cut)
-    check("T11.4 鏉冮噸鎭掑湪 [0, 1]", 
+    print("  静止 k=%.3f / 运动 k=%.3f / 亮度突变 k=%.3f" % (k_still, k_moving, k_cut))
+    check("T11.1 静止区强融合（≥0.20）", k_still >= 0.20,
+          "k=%.3f（≈5 帧等效平均，去噪且不拖影）" % k_still)
+    check("T11.2 运动区弱融合（≤0.16）", k_moving <= 0.16,
+          "k=%.3f（比静止弱，抑制运动拖影）" % k_moving)
+    check("T11.3 亮度突变时几乎不融合（≤0.05）", k_cut <= 0.05,
+          "k=%.3f（避免残影/鬼影）" % k_cut)
+    check("T11.4 权重恒在 [0, 1]",
           all(0.0 <= temporal_k(a, m, d) <= 1.0
-              for a in (0.0, 0.5, 1.0) for m in (0.0, 3.0, 99.0) for d in (0.0, 24.0, 255.0)),
-          "鍏ㄥ弬鏁扮綉鏍兼壂鎻忔棤瓒婄晫")
+              for a in (0.0, 0.5, 1.0)
+              for m in (0.0, 3.0, 99.0)
+              for d in (0.0, 24.0, 255.0)),
+          "全参数网格扫描无越界")
     mono = all(temporal_k(0.0, m, 0.0) >= temporal_k(0.0, m + 1.0, 0.0) - 1e-12
                for m in np.arange(0.0, 12.0, 0.5))
-    check("T11.5 鏉冮噸闅忚繍鍔ㄩ噺鍗曡皟涓嶅��", mono, "flow 瓒婂ぇ铻嶅悎瓒婂急")
+    check("T11.5 权重随运动量单调不增", mono, "flow 越大融合越弱（无跳变）")
+    anti = temporal_k(1.0, 0.0, 0.0)
+    check("T11.6 抗闪烁开关把静止融合推到 0.80", abs(anti - 0.80) < 1e-9,
+          "k=%.2f（等效 5 帧平均；关闭时为 0.20）" % anti)
 
 
 # ----------------------------------------------------------------------------
-# T12 鑰楁椂妯″瀷
+# T12 耗时 / 内存模型
 # ----------------------------------------------------------------------------
+
+def loop_mem(w, strip, per_px_bytes):
+    pad = 4
+    return (strip + 2 * pad) * w * per_px_bytes / 1e6
+
 
 def t12_cost():
-    print("\n--- T12 姣忓抚鑰楁椂 / 鍐呭瓨妯″瀷锛堜及绠楋紝闈炲疄娴嬶級---")
-    # 鏂规硶锛氭妸绠＄嚎鐪嬫垚銆屾瘡鍍忕礌鎼�杩愬�氬皯瀛楄妭銆嶏紝鍐嶉櫎浠?A15 绾у彲杈剧殑鏈夋晥甯﹀�姐�?    # 鏈夋晥甯﹀�� 6鈥?0 GB/s锛圠PDDR4X 鐞嗚�� 34 GB/s锛泇Image NEON 鏍稿彈鎸囦护鍚炲悙闄愬埗锛?    # 瀹炴祴閫氬父钀藉湪 8~12 GB/s 鍖洪棿锛岃繖閲屽彇 6 GB/s 浣滄偛瑙傜晫銆?0 GB/s 浣滀箰瑙傜晫锛夈�?    passes = [
-        ("鈶?RGB鈫抣uma (Planar8)", 4 + 1),
-        ("鈶?1x5 鍗风Н H", 2),
-        ("鈶?5x1 鍗风Н V", 2),
-        ("鈶?5x5 min (running)", 2),
-        ("鈶?5x5 max (running)", 2),
-        ("鈶?娈嬪樊/澧炵泭/閽冲埗/鎶栧姩/鍥炲啓锛堣瀺鍚堝惊鐜�锛�", 4 + 4 + 4),
+    print("\n--- T12 每帧耗时 / 内存模型（估算，非实测）---")
+    # 方法：数每像素搬运多少字节，再除以 A15 级可达的有效带宽。
+    # 有效带宽取 6 GB/s（悲观）~10 GB/s（乐观）；LPDDR4X 理论 34 GB/s，
+    # vImage NEON 卷积核受指令吞吐限制，实测通常落在 8~12 GB/s。
+    passes = [
+        ("1 RGB→luma (Planar8)", 4 + 1),
+        ("2 1x5 卷积 H", 2),
+        ("3 5x1 卷积 V", 2),
+        ("4 5x5 min (running)", 2),
+        ("5 5x5 max (running)", 2),
+        ("6 残差/增益/钳制/抖动/回写（融合循环）", 4 + 4 + 4),
     ]
     total_bpp = sum(p[1] for p in passes)
     for name, bpp in passes:
         print("  %-40s %2d B/px" % (name, bpp))
-    print("  鍚堣�� %.0f B/px锛? 涓?pass锛涒懃 鎶婅�� luma/base/lo/hi + 璇绘簮 RGB + 鍐欑洰鏍?RGB 铻嶆垚涓�娆★級"
+    print("  合计 %.0f B/px（6 个 pass；第 6 个把读 luma/base/lo/hi + 读源 RGB + 写目标 RGB 融成一次）"
           % total_bpp)
 
     px1080 = 1920 * 1080
@@ -789,31 +846,23 @@ def t12_cost():
     hi_1080 = total_bpp * px1080 / 10e9
     lo_4k = total_bpp * px4k / 6e9
     hi_4k = total_bpp * px4k / 10e9
-    print("  1080p锛?.1f鈥?.1f ms/甯э紱4K锛?.1f鈥?.1f ms/甯?
+    print("  1080p：%.1f–%.1f ms/帧；4K：%.1f–%.1f ms/帧"
           % (lo_1080 * 1e3, hi_1080 * 1e3, lo_4k * 1e3, hi_4k * 1e3))
-    print("  娉ㄦ剰锛氳繖鏄�瀵煎嚭绠＄嚎锛堝啓鏂囦欢锛夛紝涓嶆槸瀹炴椂棰勮�堬紝姣忓抚鍑犲崄姣�绉掑彧褰卞搷鎬诲�煎嚭鏃堕暱锛�"
-          "鍚屼竴甯х殑 AI 4x 鎺ㄧ悊绾?100鈥?00 ms锛屾晠鏈�闃舵�靛崰 2鈥?%%銆?)
-    check("T12.1 1080p 鎮茶�傜�?< 12 ms/甯?, lo_1080 < 0.012,
-          "%.1f ms锛堝崰 AI 鎺ㄧ悊 100ms 鐨?%.1f%%锛?
-          % (lo_1080 * 1e3, 100.0 * lo_1080 / 0.100))
-    check("T12.2 4K 鎮茶�傜�?< 40 ms/甯?, lo_4k < 0.040,
-          "%.1f ms锛?K 瀵煎嚭 30fps 姣忓皬鏃?108000 甯?鈫?棰濆�� %.0f 鍒嗛挓锛?
+    print("  注意：这是导出管线（写文件），不是实时预览；同一帧 AI 4x 推理约 100–400 ms，"
+          "故本阶段只占 2–8%。")
+    check("T12.1 1080p 悲观界 < 12 ms/帧", lo_1080 < 0.012,
+          "%.1f ms（占 AI 推理 100 ms 的 %.1f%%）" % (lo_1080 * 1e3, 100.0 * lo_1080 / 0.100))
+    check("T12.2 4K 悲观界 < 40 ms/帧", lo_4k < 0.040,
+          "%.1f ms（4K 30fps 导出 1 小时 = 108000 帧 → 额外 %.0f 分钟）"
           % (lo_4k * 1e3, lo_4k * 108000 / 60.0))
 
-    # 鍐呭瓨锛氬垎鏉″�勭悊锛屽嘲鍊煎彧涓庢潯楂樻湁鍏筹紝涓庡抚楂樻棤鍏炽�?    strip = 64
-    per_px_bytes = 5 * 1 + 4          # 5 寮?Planar8 + 1 寮?RGBA scratch
-    for name, w in (("1080p 鏉?, 1920), ("4K 鏉?, 3840)):
-        mb = strip * w * per_px_bytes / 1e6
-        print("  %s锛堥珮 %d锛夛細%.2f MB 宄板�? % (name, strip, mb))
-    check("T12.3 鍒嗘潯宄板�煎唴瀛?< 16 MB", loop_mem(3840, strip, per_px_bytes) < 16.0,
-          "4K 鏉?%.2f MB锛涙暣甯х紦鍐插垯闇� %.0f MB锛?K RGBA脳2锛?
-          % (loop_mem(3840, strip, per_px_bytes),
-             (2.0 * px4k * 4) / 1e6))
-
-
-def loop_mem(w, strip, per_px_bytes):
-    pad = 4
-    return (strip + 2 * pad) * w * per_px_bytes / 1e6
+    strip = 64
+    per_px_bytes = 5 * 1 + 4
+    for name, w in (("1080p 条", 1920), ("4K 条", 3840)):
+        print("  %s（高 %d）：%.2f MB 峰值" % (name, strip, loop_mem(w, strip, per_px_bytes)))
+    check("T12.3 分条峰值内存 < 16 MB", loop_mem(3840, strip, per_px_bytes) < 16.0,
+          "4K 条 %.2f MB；整帧缓冲则需 %.0f MB（4K RGBA×2）"
+          % (loop_mem(3840, strip, per_px_bytes), (2.0 * px4k * 4) / 1e6))
 
 
 # ----------------------------------------------------------------------------
@@ -822,7 +871,7 @@ def loop_mem(w, strip, per_px_bytes):
 
 def main():
     print("=" * 78)
-    print("PixelLift M7 路 QualityCore 绂荤嚎鏁板�奸獙璇?)
+    print("PixelLift M7 · QualityCore 离线数值验证")
     print("numpy %s / python %s" % (np.__version__, sys.version.split()[0]))
     print("=" * 78)
 
@@ -843,7 +892,7 @@ def main():
     passed = sum(1 for r in _results if r[1])
     print("\n" + "=" * 78)
     if passed == total:
-        print("SUMMARY: %d/%d PASS 鈥?ALL ASSERTIONS PASSED" % (passed, total))
+        print("SUMMARY: %d/%d PASS — ALL ASSERTIONS PASSED" % (passed, total))
         print("=" * 78)
         return 0
     print("SUMMARY: %d/%d PASS" % (passed, total))

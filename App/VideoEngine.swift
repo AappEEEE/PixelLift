@@ -122,6 +122,10 @@ struct VideoSettings: Sendable {
     var hdrEnabled: Bool
     var hdrIntensity: Double
     var detail: Double
+    /// 降噪量 0…1：只在亮度残差的小幅度区间生效，越大越把噪点压向低频基底。0 = 只锐化。
+    var denoise: Double
+    /// 逐像素自适应抗闪烁（仅 AI 逐帧超分时生效）。关掉后帧间抖动会明显。
+    var antiFlicker: Bool
 }
 
 /// MLModel 不是 Sendable，用盒子跨线程传
@@ -764,16 +768,20 @@ enum VideoRenderer {
         var cancelled = false
         var prevBuf: [UInt8]?
         var prevCG: CGImage?
-        var lastBuf: [UInt8]?
         var scratch = [UInt8](repeating: 0, count: tw * th * 4)
         var accum = [UInt8](repeating: 0, count: tw * th * 4)
-        var stable = [UInt8](repeating: 0, count: tw * th * 4)
+        // 抗闪烁要用“上一帧的稳定结果”，所以必须双缓冲轮换：
+        // 融合时 inout 写到「不是上一帧、也不是当前帧」的那一块，避免触发整帧 COW（4K 每帧白抄 33MB）。
+        var stableA = [UInt8](repeating: 0, count: tw * th * 4)
+        var stableB = [UInt8](repeating: 0, count: tw * th * 4)
+        var stableIsA = true
         var prevStable: [UInt8]?
+        var tailBuf: [UInt8]?
         // 线性光累积缓冲：tw*th*3 个 Float，1.4MP 输出约 16.8MB。首次 compose 时按需扩容，之后复用。
         var blurLight: [Float] = []
         var reportedBlurCost = false
-        // AI 逐帧超分天然会抖：只在这种模式下做时域融合，快速放大已经足够稳定。
-        let temporalWeight: Float = settings.useAI ? 0.22 : 0
+        // AI 逐帧超分天然会抖：只在这种模式下做逐像素自适应时域融合（快速放大已经足够稳定）。
+        let temporalOn: Bool = settings.useAI
 
         func writeFrame(_ buf: [UInt8]) throws {
             let pts = CMTime(seconds: Double(outIndex) / outFps, preferredTimescale: 600)
@@ -863,7 +871,7 @@ enum VideoRenderer {
 
             if let prev = prevBuf, prev.count == buf.count {
                 let needsInterp = perPair > 1 || blurOn
-                let needsFlow = needsInterp || temporalWeight > 0
+                let needsFlow = needsInterp || temporalOn
                 let flow: FlowField? = needsFlow && prevCG != nil
                     ? FrameOps.flow(from: prevCG!, to: cg)
                     : nil
@@ -879,13 +887,29 @@ enum VideoRenderer {
                              + String(format: "%.2f", Double(avg)) + " 次采样/像素")
                 }
 
-                // 当前帧先做时域融合，再和上一帧合成中间帧；两端都用稳定后的结果，时间轴不乱。
+                // 当前帧先做逐像素自适应时域融合，再和上一帧合成中间帧；两端都用稳定后的结果，时间轴不乱。
                 var outBuf = buf
-                if temporalWeight > 0, let prevStable {
-                    FrameOps.blendTemporal(prev: prevStable, cur: buf, w: tw, h: th,
-                                           flow: flow, flowScale: flowScale,
-                                           weight: temporalWeight, out: &stable)
-                    outBuf = stable
+                if temporalOn, let prevStable {
+                    var blended = false
+                    if stableIsA {
+                        blended = QualityCore.blendTemporalAdaptive(
+                            prev: prevStable, cur: buf, width: tw, height: th,
+                            flow: flow, flowScale: flowScale,
+                            antiFlicker: settings.antiFlicker, out: &stableA)
+                        if !blended { stableA = buf }
+                    } else {
+                        blended = QualityCore.blendTemporalAdaptive(
+                            prev: prevStable, cur: buf, width: tw, height: th,
+                            flow: flow, flowScale: flowScale,
+                            antiFlicker: settings.antiFlicker, out: &stableB)
+                        if !blended { stableB = buf }
+                    }
+                    outBuf = stableIsA ? stableA : stableB
+                    stableIsA.toggle()
+                } else if temporalOn {
+                    // 首帧没有可融合的上一帧：当前帧原样成为稳定结果。
+                    if stableIsA { stableA = buf } else { stableB = buf }
+                    stableIsA.toggle()
                 }
                 let aBuf = prevStable ?? prev
 
@@ -895,14 +919,17 @@ enum VideoRenderer {
                     if control.cancelled { break }
                 }
                 prevStable = outBuf
-                lastBuf = outBuf
-            } else if temporalWeight > 0 {
+                tailBuf = outBuf
+            } else if temporalOn {
+                if stableIsA { stableA = buf } else { stableB = buf }
+                stableIsA.toggle()
                 prevStable = buf
+                tailBuf = buf
             }
 
             prevBuf = buf
             prevCG = cg
-            if lastBuf == nil { lastBuf = buf }
+            if tailBuf == nil { tailBuf = buf }
 
             if control.cancelled {
                 cancelled = true
@@ -910,7 +937,7 @@ enum VideoRenderer {
             }
         }
 
-        if !cancelled, let last = lastBuf {
+        if !cancelled, let last = tailBuf {
             try writeFrame(last)
         }
 
@@ -1083,8 +1110,13 @@ enum VideoRenderer {
             finalCG = Pix.resized(cg, width: tw, height: th) ?? cg
         }
         guard var out = Pix.rgba(finalCG, width: tw, height: th) else { return nil }
-        if settings.detail > 0.001 {
-            FrameOps.unsharp(&out, w: tw, h: th, amount: Float(settings.detail))
+        // M7 画质：亮度域保边锐化 + 边缘自适应降噪 + 8-bit 抖动。
+        // HDR 要关掉抖动，后面 writeP010 还会做一次 10-bit 抖动，两次叠加会形成规则纹理。
+        if settings.detail > 0.001 || settings.denoise > 0.001 {
+            QualityCore.applyDetail(&out, width: tw, height: th,
+                                    amount: Float(settings.detail),
+                                    denoise: Float(settings.denoise),
+                                    dither: !settings.hdrEnabled)
         }
         return out
     }
@@ -1106,6 +1138,10 @@ final class VideoEngine: ObservableObject {
     @Published var hdrEnabled = false
     @Published var hdrIntensity: Double = 0.65
     @Published var detail: Double = 0.25
+    /// 降噪：0 = 只锐化；0.3 大概能把中等 ISO 的噪声压掉三分之一而不糊边缘。
+    @Published var denoise: Double = 0.30
+    /// 抗闪烁：AI 逐帧超分时按光流 + 亮度差逐像素决定融合多少。
+    @Published var antiFlicker = true
     @Published var isRunning = false
     @Published var isPaused = false
     @Published var progress: Double = 0
@@ -1354,7 +1390,9 @@ final class VideoEngine: ObservableObject {
                                      expectedFrames: p.frames,
                                       hdrEnabled: hdrEnabled,
                                       hdrIntensity: hdrIntensity,
-                                      detail: detail)
+                                      detail: detail,
+                                      denoise: denoise,
+                                      antiFlicker: antiFlicker)
         let dest = FileManager.default.temporaryDirectory
             .appendingPathComponent("PixelLift-video-\(Int(Date().timeIntervalSince1970)).mp4")
         let box = ModelBox(models[modelKind] ?? models[.photo])
@@ -1501,6 +1539,8 @@ final class VideoEngine: ObservableObject {
         if slow != .normal { parts.append("慢动作 \(slow.title)") }
         if blur == .on { parts.append("动态模糊 \(shutterAngle.title)") }
         if detail > 0.001 { parts.append("细节 \(Int(detail * 100))%") }
+        if denoise > 0.001 { parts.append("降噪 \(Int(denoise * 100))%") }
+        if mode == .ai && antiFlicker { parts.append("抗闪烁") }
         if hdrEnabled { parts.append("SDR→HLG \(Int(hdrIntensity * 100))%") }
         return parts.joined(separator: " + ")
     }
@@ -1598,7 +1638,9 @@ final class VideoEngine: ObservableObject {
                              expectedFrames: p.frames,
                              hdrEnabled: hdrEnabled,
                              hdrIntensity: hdrIntensity,
-                             detail: detail)
+                             detail: detail,
+                             denoise: denoise,
+                             antiFlicker: antiFlicker)
     }
 }
 
@@ -1634,6 +1676,7 @@ enum JobStore {
             String(format: "%.3f", settings.outFps),
             settings.useAI ? "ai\(settings.aiLongEdge)" : "fast",
             "p\(settings.samplesPerPair)a\(Int(settings.shutterAngle))m\(settings.blurSampleBudget)l\(settings.blurLinearLight ? "1" : "0")",
+            "q\(Int((settings.detail * 100).rounded()))d\(Int((settings.denoise * 100).rounded()))f\(settings.antiFlicker ? "1" : "0")",
             settings.hdrEnabled ? "hdr" : "sdr"
         ].joined(separator: "|")
         return SHA256.hash(data: Data(descriptor.utf8))
