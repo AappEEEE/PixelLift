@@ -69,54 +69,12 @@ enum QualityCore {
     }()
 
     /// 亮度是否走 vImage 的定点矩阵（更快）。置 false 则走纯 Swift 逐像素，
-    /// 两者差 ≤1 码（除法舍入方式可能不同），只是慢 1–4 ms/1080p。没有 Mac 时这是
-    /// 最容易出问题的一处 API：万一签名不符，把这一行改 false 即可编译通过。
-    static let useVectorLuma: Bool = true
-
-    /// 一次性自检：vImage 的 ARGB8888 矩阵是按「内存字节序」还是按「A,R,G,B 名字序」作用。
-    /// 标准 ARGB 缓冲上两者等价，但我们的缓冲是 CGContext 出来的 R,G,B,X（noneSkipLast），
-    /// 若权重错位，整帧亮度会算错——肉眼只表现为「轻微偏色/发灰」，CI 抓不到。
-    /// 所以用 1 个像素实测：通道序错了会差 60 码以上，容差 ±1 即可判定。
-    static let vectorLumaTrusted: Bool = {
-        // 探针：R=64 G=128 B=192 X=255  →  期望 119
-        // 用 allocate 而不是 &array：vImage_Buffer 会保存指针，指针必须比这次调用活得久。
-        let srcPtr: UnsafeMutablePointer<UInt8> = UnsafeMutablePointer<UInt8>.allocate(capacity: 4)
-        let dstPtr: UnsafeMutablePointer<UInt8> = UnsafeMutablePointer<UInt8>.allocate(capacity: 1)
-        defer {
-            srcPtr.deallocate()
-            dstPtr.deallocate()
-        }
-        srcPtr[0] = 64
-        srcPtr[1] = 128
-        srcPtr[2] = 192
-        srcPtr[3] = 255
-        dstPtr[0] = 0
-
-        let expect: Int = (54 * 64 + 183 * 128 + 19 * 192 + 128) >> 8
-        var s = vImage_Buffer(data: UnsafeMutableRawPointer(srcPtr),
-                              height: 1,
-                              width: 1,
-                              rowBytes: 4)
-        var d = vImage_Buffer(data: UnsafeMutableRawPointer(dstPtr),
-                              height: 1,
-                              width: 1,
-                              rowBytes: 1)
-        var matrix: [Int16] = [54, 183, 19, 0]
-        let err: vImage_Error = vImageMatrixMultiply_ARGB8888ToPlanar8(&s,
-                                                                      &d,
-                                                                      &matrix,
-                                                                      256,
-                                                                      nil,
-                                                                      nil,
-                                                                      vImage_Flags(kvImageNoFlags))
-        if err != kvImageNoError { return false }
-        let got: Int = Int(dstPtr[0])
-        let delta: Int = got - expect
-        if delta < -1 { return false }
-        if delta > 1 { return false }
-        return true
-    }()
-
+    /// 亮度转换原本走 vImageMatrixMultiply_ARGB8888ToPlanar8，但该 API 在 Swift 里
+    /// 的重载/property 标注版本差异大（CI 首轮报了参数个数不匹配），改为纯 Swift 循环：
+    /// 我们本来就是定点整数（54R+183G+19B+128)>>8，逐像素写法没有歧义，
+    /// 4K 一帧也就几十毫秒，相对逐帧 AI 重建可以忽略。
+    static let useVectorLuma: Bool = false
+    static let vectorLumaTrusted: Bool = false
     // MARK: - 入口：细节增强 + 降噪 + 抖动
 
     /// 就地处理一帧 RGBA8888（noneSkipLast，即 alpha 位不用）。
@@ -388,29 +346,7 @@ enum QualityCore {
                                  rows: Int,
                                  width: Int,
                                  dst: UnsafeMutablePointer<UInt8>) {
-        // vectorLumaTrusted 为 false 时直接走下面的逐像素实现（通道序自检没过）
-        if useVectorLuma, vectorLumaTrusted {
-            // vImage 的 matrix 是 4×1，按内存字节序作用：R,G,B,X → 权重 54,183,19,0
-            var matrix: [Int16] = [lumaR, lumaG, lumaB, 0]
-            var s = vImage_Buffer(data: UnsafeMutableRawPointer(mutating: src),
-                                  height: vImagePixelCount(rows),
-                                  width: vImagePixelCount(width),
-                                  rowBytes: width * 4)
-            var d = vImage_Buffer(data: UnsafeMutableRawPointer(dst),
-                                  height: vImagePixelCount(rows),
-                                  width: vImagePixelCount(width),
-                                  rowBytes: width)
-            let err: vImage_Error = vImageMatrixMultiply_ARGB8888ToPlanar8(&s,
-                                                                          &d,
-                                                                          &matrix,
-                                                                          256,
-                                                                          nil,
-                                                                          nil,
-                                                                          vImage_Flags(kvImageNoFlags))
-            if err == kvImageNoError { return }
-            // 出错就落到下面的逐像素实现，不中断整帧
-        }
-
+        // 纯 Swift 定点实现：与 Python 的 (54R+183G+19B+128)>>8 逐位一致。
         var r: Int = 0
         while r < rows {
             let sRow: Int = r * width * 4
@@ -458,7 +394,6 @@ enum QualityCore {
                                                            kernelHeight,
                                                            kernelWidth,
                                                            divisor,
-                                                           nil,
                                                            vImage_Flags(kvImageEdgeExtend))
             ok = (err == kvImageNoError)
         }
@@ -484,9 +419,9 @@ enum QualityCore {
         let flags: vImage_Flags = vImage_Flags(kvImageEdgeExtend)
         var err: vImage_Error = kvImageNoError
         if isMin {
-            err = vImageMin_Planar8(&s, &d, 0, 0, 5, 5, flags)
+            err = vImageMin_Planar8(&s, &d, nil, 0, 0, 5, 5, flags)
         } else {
-            err = vImageMax_Planar8(&s, &d, 0, 0, 5, 5, flags)
+            err = vImageMax_Planar8(&s, &d, nil, 0, 0, 5, 5, flags)
         }
         return err == kvImageNoError
     }
