@@ -781,9 +781,7 @@ enum VideoRenderer {
 
         // 快门采样：三角权重（中间重、两端轻）比等权平均更像真实快门的连续曝光，
         // 运动物体的拖影过渡更平滑，也不会出现等权平均那种「台阶」。
-        let blurOffsets: [Float]
-        let blurWeights: [Float]
-        do {
+        let blurPlan: (offsets: [Float], weights: [Float]) = {
             var offsets: [Float] = []
             var weights: [Float] = []
             let spread = 0.40 / Float(max(2, perPair))
@@ -793,9 +791,10 @@ enum VideoRenderer {
                 offsets.append(x * spread)
                 weights.append(max(0.08, 1 - abs(x) / (half + 0.5)))
             }
-            blurOffsets = offsets
-            blurWeights = weights
-        }
+            return (offsets, weights)
+        }()
+        let blurOffsets = blurPlan.offsets
+        let blurWeights = blurPlan.weights
 
         func emit(_ a: [UInt8], _ b: [UInt8], t: Float,
                   flow: FlowField?, flowScale: Float) throws {
