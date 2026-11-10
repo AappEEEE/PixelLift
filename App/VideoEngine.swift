@@ -630,6 +630,24 @@ enum VideoRenderer {
         if let timeRange {
             reader.timeRange = timeRange
         }
+        // 分片时解码出的音频仍带源码时间戳，直接写进分片文件会 A/V 不同步、时长错，
+        // 所以按片段起点把 PTS 平移到 0。
+        let audioOffset = timeRange?.start ?? .zero
+
+        func retimedAudio(_ buffer: CMSampleBuffer) -> CMSampleBuffer? {
+            guard audioOffset.seconds > 0 else { return buffer }
+            var timing = CMSampleTimingInfo()
+            timing.duration = CMSampleBufferGetDuration(buffer)
+            timing.presentationTimeStamp = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(buffer), audioOffset)
+            timing.decodeTimeStamp = .invalid
+            var output: CMSampleBuffer?
+            let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
+                                                               sampleBuffer: buffer,
+                                                               sampleTimingEntryCount: 1,
+                                                               sampleTimingArray: &timing,
+                                                               sampleBufferOut: &output)
+            return status == noErr ? output : nil
+        }
 
         let videoOut = AVAssetReaderVideoCompositionOutput(
             videoTracks: [track],
@@ -825,7 +843,9 @@ enum VideoRenderer {
             guard !audioFinished, let audioIn, let audioOut else { return }
             while audioIn.isReadyForMoreMediaData {
                 if let sample = audioOut.copyNextSampleBuffer() {
-                    audioIn.append(sample)
+                    if let shifted = retimedAudio(sample) {
+                        audioIn.append(shifted)
+                    }
                 } else {
                     audioFinished = true
                     audioIn.markAsFinished()
