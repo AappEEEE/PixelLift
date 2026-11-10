@@ -276,9 +276,10 @@ final class UpscaleEngine: ObservableObject {
     private var control: RunControl?
     private var task: Task<Void, Never>?
 
-    /// AI 推理输入上限
-    private let aiInputMaxEdge = 1024
-    private let aiInputMaxPixels = 1_048_576
+    /// AI 重建输入上限（长边）。2048 是质量与内存的折中：再大 Core ML 分块数会翻倍，收益递减。
+    private let aiCapEdge = 2048
+    /// AI 输入像素预算。输出缓冲 = 16 倍像素 × 4 字节，240 万像素 → 约 154MB
+    private let aiPixelBudget = 2_400_000
     /// 导出上限
     private let maxOutEdge = 8192
     private let maxOutPixels = 24_000_000
@@ -363,14 +364,20 @@ final class UpscaleEngine: ObservableObject {
             notes.append("已限制到 \(tw)×\(th)（上限 \(maxOutEdge)px / 24MP）")
         }
 
-        var aiEdge = min(aiInputMaxEdge, max(w0, h0))
-        if w0 * h0 > aiInputMaxPixels {
-            let k = (Double(aiInputMaxPixels) / Double(w0 * h0)).squareRoot()
-            aiEdge = min(aiEdge, Int(Double(max(w0, h0)) * k))
+        var aiEdge = min(aiCapEdge, max(w0, h0))
+        let ideal = Int((Double(max(tw, th)) / 4.0).rounded())
+        if ideal > aiEdge { aiEdge = min(aiCapEdge, ideal) }
+
+        // 像素预算：4× 输出的 RGB 缓冲 = 输入像素 × 16 × 4 字节，超了就往回收
+        func aiPixels(_ edge: Int) -> Double {
+            let k = Double(edge) / Double(max(w0, h0))
+            return Double(w0) * k * Double(h0) * k
         }
-        if aiEdge < max(w0, h0) {
-            notes.append("长边 \(aiEdge)px 重建后放大")
+        while aiEdge > 320 && aiPixels(aiEdge) > Double(aiPixelBudget) {
+            aiEdge = Int(Double(aiEdge) * 0.93)
         }
+
+        notes.append("AI 在长边 \(aiEdge)px 上重建")
         return Plan(targetWidth: tw, targetHeight: th, aiLongEdge: aiEdge,
                     note: notes.isEmpty ? nil : notes.joined(separator: "；"))
     }

@@ -152,6 +152,7 @@ struct ContentView: View {
             if engine.isRunning {
                 ProgressView(value: engine.overallProgress)
                     .tint(.accentColor)
+                    .animation(.linear(duration: 0.25), value: engine.overallProgress)
             }
 
             ForEach(engine.items) { item in
@@ -194,6 +195,7 @@ struct ContentView: View {
                 if item.state == .running {
                     ProgressView(value: item.progress)
                         .controlSize(.small)
+                        .animation(.linear(duration: 0.2), value: item.progress)
                 } else {
                     HStack(spacing: 8) {
                         Text(item.state.label)
@@ -432,7 +434,7 @@ struct ContentView: View {
         let info = Bundle.main.infoDictionary ?? [:]
         let version = info["CFBundleShortVersionString"] as? String ?? "?"
         let build = info["CFBundleVersion"] as? String ?? "?"
-        return Text("v\(version) (build \(build)) · 批量 + 文件导入版")
+        return Text("v\(version) (build \(build)) · 高分辨率重建版")
             .font(.caption2)
             .foregroundStyle(.tertiary)
             .frame(maxWidth: .infinity, alignment: .center)
@@ -452,7 +454,7 @@ struct ContentView: View {
 
                     bullet("全部在本机推理，图片不上传、不需要网络。")
                     bullet("原生 AI 倍率为 4×；选 1.5×/2×/2.5×/3× 时先在 4× 上重建再缩回，选 6×/8× 时重建后再放大——所以界面会标注「AI 原生」还是「AI+缩放」。")
-                    bullet("原图长边超过 1024px 时，AI 先按 1024px 重建再放大到目标尺寸，这是移动端内存的折中。")
+                    bullet("AI 重建分辨率自动取「目标尺寸 ÷ 4」，上限长边 2048px——保证 4× 结果不小于目标尺寸，基本不做二次放大，这是清晰度的关键。")
                     bullet("单张输出上限 8192px / 2400 万像素，超出会自动限制并在图上标注。")
                     bullet("分块推理带 32px 重叠并丢弃边缘，拼接处不会有接缝和白边。")
                     bullet("处理中可暂停/继续/取消；一批里的每一张都有独立进度。")
