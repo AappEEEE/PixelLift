@@ -6,7 +6,8 @@
 - SDR 源帧处理为：解码到 RGB8 → sRGB/BT.709 EOTF → 在线性光域计算亮度并作可调高光肩部 → 线性 Rec.709/BT.709 primaries 转线性 Rec.2020 → 分量级 BT.2100 HLG OETF → 按 BT.2020 coefficients 生成 Y′CbCr 4:2:0 video-range P010（10-bit 左对齐）→ HEVC。
 - 输出标注 BT.2020 primaries / matrix + BT.2100 HLG transfer；SDR 路径继续用 8-bit BGRA 和 Rec.709 metadata。
 - SDR reference white 映射至 HLG 场景参考白 0.75。亮度肩部以 `u = clamp((Y−0.70)/0.30, 0, 1)`、`k = u²(3−2u)` 定义，`Y' = Y + strength × 0.30 × k²`，使低于 70% 线性亮度的暗部/中间调保持不动。之后线性 Rec.2020 各 RGB 分量分别施加 HLG OETF，再计算非线性 BT.2020 Y′CbCr。固定 4×4 Bayer dithering 在空间上打散 10-bit 量化边界，避免时域随机噪声。
-- 为控制转码热量和内存，开启 HDR 时输出限制在约 1920 长边 / 2.1MP，且尺寸必须为偶数（应用输出规划会保持偶数）。
+- 输出上限沿用 SDR 的 4K / 830 万像素：P010 单帧缓冲只有同尺寸 BGRA 的一半（4K 约 12MB），瓶颈在 AI 推理与逐像素换算，不在编码器。尺寸必须为偶数（4:2:0 色度），规划里会自动取偶。
+- 码率按 0.12 bpp × 像素数 × 输出帧率估算（4K30 约 30 Mbps），下限 8 Mbps。若真机出现编码器拒绝或不支持 Main10，需要回退到 8-bit SDR 输出并在 UI 明确提示。
 
 ## “HDR”能力边界
 

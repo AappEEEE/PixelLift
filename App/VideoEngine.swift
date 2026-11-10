@@ -1245,9 +1245,9 @@ final class VideoEngine: ObservableObject {
         }
 
         if hdrEnabled {
-            capEdge = min(capEdge, 1920)
-            capPix = min(capPix, 2_100_000)
-            notes.append("HLG/BT.2020 10-bit 输出，设备编码兼容性以真机验证为准")
+            // HDR 不再额外降分辨率：P010 单帧缓冲只有同尺寸 BGRA 的一半（4K 约 12MB），
+            // 真正的瓶颈是 AI 推理与逐像素换算，不是编码器。上限沿用 4K / 830 万像素。
+            notes.append("HLG/BT.2020 10-bit 输出，上限 4K / 830 万像素；设备编码兼容性以真机验证为准")
         }
 
         if hdrEnabled {

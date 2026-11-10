@@ -123,6 +123,7 @@ jobs:
             - 逐像素：Rec.709 SDR → 线性光 → 可调高光肩部 → Rec.2020 → BT.2100 HLG → P010 10-bit HEVC
             - 写入 Rec.2020 primaries/matrix 与 HLG transfer metadata；关闭时保留 Rec.709 SDR 输出
             - 输入已经裁掉的高光纹理不会凭空恢复；必须用支持 HLG 的设备/播放器验收
+            - 输出上限与 SDR 相同（4K / 830 万像素），P010 单帧缓冲只有同尺寸 BGRA 的一半
             - CI 编译与数学探针通过 ≠ 真机 HDR 观感已验证，本版仍无 HDR 屏幕实测
 
             ### 补帧 / 慢动作（M3）
