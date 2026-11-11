@@ -120,7 +120,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v0.1.${{ github.run_number }}
-          name: PixelLift v0.1.${{ github.run_number }} · M0–M7 全能力（HDR / 分片续传 / 画质打磨）
+          name: PixelLift v0.1.${{ github.run_number }} · M0–M7（HDR / 补帧 / 系统 Liquid Glass 导航）
           make_latest: true
           files: |
             PixelLift.ipa
