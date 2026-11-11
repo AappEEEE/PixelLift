@@ -1,4 +1,4 @@
-import CoreImage
+﻿import CoreImage
 import CoreML
 import Foundation
 import ImageIO
@@ -545,41 +545,26 @@ final class UpscaleEngine: ObservableObject {
 
         // 整条重活（缩放、推理、拼图、保边锐化、缩到目标、编码）全在后台，
         // 主线程只负责把结果写回 items。以前这些都在主线程，24MP 一单会冻 UI 两秒以上。
+        // Task.detached 的闭包继承外层 @MainActor 隔离，所以必须显式标 nonisolated(unsafe)；
+        // 闭包里只读值类型与 immutable 输入，不碰任何 @Published 状态。
+        nonisolated(unsafe) let photoJob = PhotoJob(
+            source: cg, aiLongEdge: p.aiLongEdge,
+            targetW: targetW, targetH: targetH,
+            detail: detailAmount, denoise: denoiseAmount,
+            format: format, name: item.name, index: idx + 1,
+            model: model, control: ctl, itemID: id)
+
         let result: (url: URL?, thumb: UIImage?, label: String)? = await Task.detached(priority: .userInitiated) {
             () -> (URL?, UIImage?, String)? in
-            var aiInput = cg
-            if max(cg.width, cg.height) > p.aiLongEdge {
-                aiInput = Self.resized(cg, longEdge: p.aiLongEdge) ?? cg
-            }
-            let w = aiInput.width, h = aiInput.height
-            guard let rgbx = Self.rgbx(aiInput, width: w, height: h) else { return nil }
-
-            let buf: [UInt8]? = TileEngine.upscale(
-                model: model, rgbx: rgbx, width: w, height: h, control: ctl,
-                onProgress: { done, total in
-                    Task { @MainActor [weak self] in
-                        self?.setTileProgress(id: id, done: done, total: total)
-                    }
-                },
-                onFallback: { message in
-                    Task { @MainActor [weak self] in
-                        if self?.notice == nil { self?.notice = message }
-                    }
+            photoJob.run(onProgress: { done, total in
+                Task { @MainActor [weak self] in
+                    self?.setTileProgress(id: id, done: done, total: total)
                 }
-            )
-
-            guard let out = buf else { return nil }
-            let outW = w * 4, outH = h * 4
-            guard let aiCG = Self.makeCGImage(from: out, width: outW, height: outH) else { return nil }
-            let resizedCG = Self.resampled(aiCG, width: targetW, height: targetH) ?? aiCG
-            let finalCG = Self.detailPass(resizedCG, detail: detailAmount, denoise: denoiseAmount) ?? resizedCG
-            let url = Self.write(finalCG, format: format, name: item.name, index: idx + 1)
-            let attrs = url.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
-            let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-            let kb = max(1, bytes / 1024)
-            let thumb = Self.thumbnail(finalCG, maxEdge: 240)
-            let label = "\(finalCG.width) × \(finalCG.height) · \(kb) KB"
-            return (url, thumb, label)
+            }, onFallback: { message in
+                Task { @MainActor [weak self] in
+                    if self?.notice == nil { self?.notice = message }
+                }
+            })
         }.value
 
         guard let result else {
@@ -667,7 +652,7 @@ final class UpscaleEngine: ObservableObject {
         return out ?? image.cgImage
     }
 
-    private static func rgbx(_ cg: CGImage, width: Int, height: Int) -> [UInt8]? {
+    nonisolated private static func rgbx(_ cg: CGImage, width: Int, height: Int) -> [UInt8]? {
         var buffer = [UInt8](repeating: 0, count: width * height * 4)
         let ok = buffer.withUnsafeMutableBytes { raw -> Bool in
             guard let base = raw.baseAddress else { return false }
@@ -683,7 +668,7 @@ final class UpscaleEngine: ObservableObject {
         return ok ? buffer : nil
     }
 
-    private static func makeCGImage(from buffer: [UInt8], width: Int, height: Int) -> CGImage? {
+    nonisolated private static func makeCGImage(from buffer: [UInt8], width: Int, height: Int) -> CGImage? {
         var copy = buffer
         return copy.withUnsafeMutableBytes { raw -> CGImage? in
             guard let base = raw.baseAddress else { return nil }
@@ -696,7 +681,7 @@ final class UpscaleEngine: ObservableObject {
         }
     }
 
-    private static func thumbnail(_ cg: CGImage, maxEdge: Int) -> UIImage? {
+    nonisolated private static func thumbnail(_ cg: CGImage, maxEdge: Int) -> UIImage? {
         let k = Double(maxEdge) / Double(max(cg.width, cg.height))
         if k >= 1 {
             return UIImage(cgImage: cg)
@@ -706,7 +691,7 @@ final class UpscaleEngine: ObservableObject {
         return resampled(cg, width: w, height: h).map { UIImage(cgImage: $0) }
     }
 
-    private static func resized(_ cg: CGImage, longEdge: Int) -> CGImage? {
+    nonisolated private static func resized(_ cg: CGImage, longEdge: Int) -> CGImage? {
         let w = cg.width, h = cg.height
         let k = Double(longEdge) / Double(max(w, h))
         let nw = max(1, Int(Double(w) * k)), nh = max(1, Int(Double(h) * k))
@@ -715,7 +700,7 @@ final class UpscaleEngine: ObservableObject {
 
     /// 细节/降噪：与视频侧共用 QualityCore（亮度域保边锐化 + 软门限降噪 + 8-bit 抖动）。
     /// 纯 Swift 实现，照片尺寸通常 8–24MP，单张几十到两百毫秒，用户感知不到。
-    static func detailPass(_ cg: CGImage, detail: Double, denoise: Double) -> CGImage? {
+    nonisolated static func detailPass(_ cg: CGImage, detail: Double, denoise: Double) -> CGImage? {
         if detail <= 0.001 && denoise <= 0.001 { return cg }
         let w = cg.width
         let h = cg.height
@@ -738,7 +723,8 @@ final class UpscaleEngine: ObservableObject {
         return makeCGImage(from: buf, width: w, height: h)
     }
 
-    static func resampled(_ cg: CGImage, width: Int, height: Int) -> CGImage? {        if width == cg.width && height == cg.height { return cg }
+    nonisolated static func resampled(_ cg: CGImage, width: Int, height: Int) -> CGImage? {
+        if width == cg.width && height == cg.height { return cg }
         let space = CGColorSpaceCreateDeviceRGB()
         guard let ctx = CGContext(data: nil, width: width, height: height,
                                   bitsPerComponent: 8, bytesPerRow: width * 4,
@@ -749,7 +735,7 @@ final class UpscaleEngine: ObservableObject {
         return ctx.makeImage()
     }
 
-    private static func write(_ cg: CGImage, format: ExportFormat, name: String, index: Int) -> URL? {
+    nonisolated private static func write(_ cg: CGImage, format: ExportFormat, name: String, index: Int) -> URL? {
         let safe = name.replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
         let file = "PixelLift-\(index)-\(Int(Date().timeIntervalSince1970))-\(safe).\(format.ext)"
@@ -761,5 +747,62 @@ final class UpscaleEngine: ObservableObject {
         CGImageDestinationAddImage(dest, cg, opts as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return url
+    }
+}
+
+// MARK: - 单张照片的后台作业
+
+/// 把「读像素 → 分块 AI → 拼图 → 缩到目标 → 保边锐化 → 编码」这一整条链搬出主线程。
+///
+/// 独立成非隔离类型的原因：`Task.detached` 的闭包会继承外层 `@MainActor` 隔离，
+/// 直接在里面调 `UpscaleEngine` 的静态方法会被判成跨 actor 访问（CI 实测报
+/// "expression is 'async' but is not marked with 'await'"）。这里只持有值类型和
+/// 已经加载好的 `MLModel`，全部是 `Sendable` 或不可变的。
+struct PhotoJob: Sendable {
+    let source: CGImage
+    let aiLongEdge: Int
+    let targetW: Int
+    let targetH: Int
+    let detail: Double
+    let denoise: Double
+    let format: UpscaleEngine.ExportFormat
+    let name: String
+    let index: Int
+    let model: MLModel?
+    let control: RunControl
+    let itemID: UUID
+
+    func run(onProgress: @Sendable (Int, Int) -> Void,
+             onFallback: @Sendable (String) -> Void) -> (url: URL?, thumb: UIImage?, label: String)? {
+        var aiInput = source
+        if max(source.width, source.height) > aiLongEdge {
+            aiInput = UpscaleEngine.resized(source, longEdge: aiLongEdge) ?? source
+        }
+        let w = aiInput.width
+        let h = aiInput.height
+        guard w > 0, h > 0, let rgbx = UpscaleEngine.rgbx(aiInput, width: w, height: h) else {
+            return nil
+        }
+
+        guard let buf = TileEngine.upscale(model: model, rgbx: rgbx, width: w, height: h,
+                                           control: control,
+                                           onProgress: onProgress,
+                                           onFallback: onFallback) else {
+            return nil
+        }
+        let outW = w * 4
+        let outH = h * 4
+        guard let aiCG = UpscaleEngine.makeCGImage(from: buf, width: outW, height: outH) else {
+            return nil
+        }
+        let resizedCG = UpscaleEngine.resampled(aiCG, width: targetW, height: targetH) ?? aiCG
+        let finalCG = UpscaleEngine.detailPass(resizedCG, detail: detail, denoise: denoise) ?? resizedCG
+        let url = UpscaleEngine.write(finalCG, format: format, name: name, index: index)
+        let attrs = url.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
+        let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+        let kb = max(1, bytes / 1024)
+        let thumb = UpscaleEngine.thumbnail(finalCG, maxEdge: 240)
+        let label = "\(finalCG.width) × \(finalCG.height) · \(kb) KB"
+        return (url, thumb, label)
     }
 }
