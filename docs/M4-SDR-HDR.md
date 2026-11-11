@@ -42,3 +42,20 @@ AVAssetWriterInput 在输出配置非法时会抛 ObjC 异常（Swift 的 do/cat
 2. 所有 AVAssetWriterInput 的创建都包在 PLTryCatch（ObjC @try/@catch）里，抛异常就回退 SDR 并提示「已自动回退到 SDR」。
 3. 即使创建成功，writer.canAdd 为 false 也会再回退一次；两次都失败才报错。
 4. P010 像素池取不到时给出明确文案，而不是笼统的「帧写入失败」。
+
+## 稳定性与性能修复（v0.1.37）
+
+一轮静态审查（无真机）后修掉的运行时问题，逐条对应到代码：
+
+1. **输出尺寸单一出口**：plan() 返回前统一把宽高取偶并夹到 ≥2，writer / adaptor / P010 / makeFrame 全吃这一份，杜绝奇数或 0 尺寸导致 AVAssetWriterInput 抛异常、或 makeFrame 与 CGContext 尺寸不一致造成的堆越界。
+2. **adaptor 也进异常护栏**：AVAssetWriterInputPixelBufferAdaptor 的字典 init 同样会抛 ObjC 异常，现在包在 PLTryCatch 里，失败给明确文案。
+3. **任何路径退出都收尾**：defer 里 cancelReading + （未成功时）cancelWriting + 删临时文件，避免 reader 悬空读取、半个 mp4 留在 tmp。
+4. **编码器失败不再死循环**：等 isReadyForMoreMediaData 的循环里检查 writer.status == .failed。
+5. **音频包时间戳钳位**：跨片起点的包平移后 PTS 为负会被 writer 拒收，现在钳到 0；被丢弃的包会计数并在结束时提示。
+6. **视频结束后抽干音轨**：以前视频先读完就 markAsFinished，音轨比视频长时末尾掉音，现在补一段 drain。
+7. **丢帧不再装作没事**：makeFrame 连续失败 8 帧直接中止并报错，而不是静默丢帧让补帧插到错误位置。
+8. **分片拼接严格化**：缺片 / 空片直接报错（以前静默跳过，用户会拿到缺一段的视频却显示完成）；export.timeRange 改用 comp.duration；末片按剩余时长截断。
+9. **P010 抖动零分配**：4×4 Bayer 表提成 SDRToHDR.bayer4 静态表，逐像素不再新建数组（4K 一帧原本 830 万次小对象分配）。
+10. **4K 缓冲按需分配**：ccum（动态模糊）与 stableA/B（抗闪烁）只在开启时分配，4K SDR 快速放大少占 100MB+。
+11. **载入不再卡主线程**：load() 的文件搬移挪到后台队列，且优先 moveItem（源本来就是选择器给的临时副本），省掉一次全量写盘——4K60 一分钟素材原本会让主线程阻塞十几秒，有看门狗风险。
+12. **Core ML 输出契约校验**：inferTile 读 o.shape 并校验 [1,3,1024,1024] + count，类型只接受 float32/float16/double；不符或量化模型直接抛错走插值，不再裸指针越界。

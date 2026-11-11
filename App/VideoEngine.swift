@@ -199,6 +199,9 @@ enum SDRToHDR {
         return hlgTable[i] * (1 - f) + hlgTable[i + 1] * f
     }
 
+    /// 4×4 Bayer 抖动矩阵（0…15），写 P010 时用 ±0.5 code 的固定图案压色带。
+    static let bayer4: [UInt8] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
+
     /// 将 SDR RGB8 转成 HLG/Rec.2020 10-bit video-range YCbCr，写入 P010 pixel buffer。
     /// P010 存储为 10-bit 左对齐 16-bit words；Y 范围 64…940，Cb/Cr 64…960。
     static func writeP010(_ rgba: [UInt8], width: Int, height: Int,
@@ -221,9 +224,9 @@ enum SDRToHDR {
         let yPlane = yBase.assumingMemoryBound(to: UInt16.self)
         let uvPlane = uvBase.assumingMemoryBound(to: UInt16.self)
         let dither: (Int, Int) -> Float = { x, y in
-            // 固定 4×4 Bayer pattern，幅度约 0.5 个 10-bit code，降低量化色带而不引入时域闪烁。
-            let matrix: [Float] = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5]
-            return (matrix[(y & 3) * 4 + (x & 3)] / 16.0 - 0.5) / 876.0
+            // 固定 4×4 Bayer，返回 ±0.47 个 10-bit code 的偏移。表是静态的：
+            // 之前每次调用都新建一个 16 元素数组，4K 一帧要分配 830 万次。
+            (Float(SDRToHDR.bayer4[((y & 3) << 2) | (x & 3)]) / 16.0 - 0.5)
         }
         @inline(__always) func clamp(_ value: Float, _ low: Float, _ high: Float) -> UInt16 {
             UInt16(min(high, max(low, value)).rounded()) << 6
@@ -239,7 +242,7 @@ enum SDRToHDR {
             for x in 0..<width {
                 let (rPrime, gPrime, bPrime) = rgb2020(x, y)
                 let yPrime = 0.2627 * rPrime + 0.6780 * gPrime + 0.0593 * bPrime
-                yPlane[y * yStride + x] = clamp(64 + 876 * yPrime + dither(x, y) * 876, 64, 940)
+                yPlane[y * yStride + x] = clamp(64 + 876 * yPrime + dither(x, y), 64, 940)
             }
         }
         for y in stride(from: 0, to: height, by: 2) {
@@ -638,7 +641,12 @@ enum VideoRenderer {
             guard audioOffset.seconds > 0 else { return buffer }
             var timing = CMSampleTimingInfo()
             timing.duration = CMSampleBufferGetDuration(buffer)
-            timing.presentationTimeStamp = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(buffer), audioOffset)
+            var pts = CMTimeSubtract(CMSampleBufferGetPresentationTimeStamp(buffer), audioOffset)
+            if !pts.isNumeric { pts = .zero }
+            // AVAssetReader 会把跨越片段起点的那个包也交出来，平移后 PTS 为负；
+            // writer.startSession(atSourceTime: .zero) 之后 append 负 PTS 必被拒，所以钳到 0。
+            if pts.seconds < 0 { pts = .zero }
+            timing.presentationTimeStamp = pts
             timing.decodeTimeStamp = .invalid
             var output: CMSampleBuffer?
             let status = CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
@@ -749,15 +757,22 @@ enum VideoRenderer {
         guard writer.canAdd(videoIn) else { throw VideoRenderError.writerSetup }
         writer.add(videoIn)
 
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: videoIn,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
-                kCVPixelBufferWidthKey as String: tw,
-                kCVPixelBufferHeightKey as String: th,
-                kCVPixelBufferIOSurfacePropertiesKey as String: [:]
-            ]
-        )
+        // adaptor 的字典 init 同样会抛 ObjC 异常（尺寸为 0/奇数、格式不支持），一并包住。
+        var adaptorBox: AVAssetWriterInputPixelBufferAdaptor?
+        let adaptorOK = PLTryCatch {
+            adaptorBox = AVAssetWriterInputPixelBufferAdaptor(
+                assetWriterInput: videoIn,
+                sourcePixelBufferAttributes: [
+                    kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
+                    kCVPixelBufferWidthKey as String: tw,
+                    kCVPixelBufferHeightKey as String: th,
+                    kCVPixelBufferIOSurfacePropertiesKey as String: [:]
+                ]
+            )
+        }
+        guard adaptorOK, let adaptor = adaptorBox else {
+            throw VideoRenderError.writeFailed("像素缓冲池配置不被这台设备接受（\(tw)×\(th)，像素格式 \(pixelFormat)）")
+        }
 
         var audioIn: AVAssetWriterInput?
         if audioOut != nil {
@@ -769,12 +784,24 @@ enum VideoRenderer {
             }
         }
 
+        // 无论从哪条路径退出，都必须收尾：否则 reader 还在 reading、writer 停在 writing，
+        // 临时文件也会残留，跑几次失败就攒一堆未释放的编码器会话。
+        var finishedCleanly = false
+        defer {
+            reader.cancelReading()
+            if !finishedCleanly {
+                if writer.status == .writing || writer.status == .unknown {
+                    writer.cancelWriting()
+                }
+                try? FileManager.default.removeItem(at: dest)
+            }
+        }
+
         guard writer.startWriting() else {
             throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "写入器启动失败")
         }
         writer.startSession(atSourceTime: .zero)
         guard reader.startReading() else {
-            writer.cancelWriting()
             throw VideoRenderError.readerSetup
         }
 
@@ -798,28 +825,34 @@ enum VideoRenderer {
 
         var outIndex = 0
         var audioFinished = false
+        var audioDropped = 0
+        var droppedFrames = 0
         var cancelled = false
         var prevBuf: [UInt8]?
         var prevCG: CGImage?
+        // AI 逐帧超分天然会抖：只在这种模式下做逐像素自适应时域融合（快速放大已经足够稳定）。
+        // 关掉「抗闪烁」就彻底不做时域融合，也不再多算一趟光流。
+        let temporalOn: Bool = settings.useAI && settings.antiFlicker
         var scratch = [UInt8](repeating: 0, count: tw * th * 4)
-        var accum = [UInt8](repeating: 0, count: tw * th * 4)
-        // 抗闪烁要用“上一帧的稳定结果”，所以必须双缓冲轮换：
-        // 融合时 inout 写到「不是上一帧、也不是当前帧」的那一块，避免触发整帧 COW（4K 每帧白抄 33MB）。
-        var stableA = [UInt8](repeating: 0, count: tw * th * 4)
-        var stableB = [UInt8](repeating: 0, count: tw * th * 4)
+        // 按需分配：4K 每块 33MB。accum 只有开动态模糊才用，stableA/B 只有开抗闪烁才用。
+        var accum: [UInt8] = blurOn ? [UInt8](repeating: 0, count: tw * th * 4) : []
+        // 抗闪烁要用“上一帧的稳定结果”，所以要双缓冲轮换：融合时 inout 写到
+        // 「不是上一帧、也不是当前帧」的那一块，避免触发整帧 COW（4K 每帧白抄 33MB）。
+        var stableA: [UInt8] = temporalOn ? [UInt8](repeating: 0, count: tw * th * 4) : []
+        var stableB: [UInt8] = temporalOn ? [UInt8](repeating: 0, count: tw * th * 4) : []
         var stableIsA = true
         var prevStable: [UInt8]?
         var tailBuf: [UInt8]?
         // 线性光累积缓冲：tw*th*3 个 Float，1.4MP 输出约 16.8MB。首次 compose 时按需扩容，之后复用。
         var blurLight: [Float] = []
         var reportedBlurCost = false
-        // AI 逐帧超分天然会抖：只在这种模式下做逐像素自适应时域融合（快速放大已经足够稳定）。
-        // 关掉「抗闪烁」就彻底不做时域融合，也不再多算一趟光流。
-        let temporalOn: Bool = settings.useAI && settings.antiFlicker
 
         func writeFrame(_ buf: [UInt8]) throws {
             let pts = CMTime(seconds: Double(outIndex) / outFps, preferredTimescale: 600)
             while !videoIn.isReadyForMoreMediaData {
+                if writer.status == .failed {
+                    throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "编码器已失败")
+                }
                 if control.cancelled { throw VideoRenderError.cancelledInternally }
                 if !control.waitIfPaused() { throw VideoRenderError.cancelledInternally }
                 Thread.sleep(forTimeInterval: 0.004)
@@ -876,7 +909,9 @@ enum VideoRenderer {
             while audioIn.isReadyForMoreMediaData {
                 if let sample = audioOut.copyNextSampleBuffer() {
                     if let shifted = retimedAudio(sample) {
-                        audioIn.append(shifted)
+                        if !audioIn.append(shifted) { audioDropped += 1 }
+                    } else {
+                        audioDropped += 1
                     }
                 } else {
                     audioFinished = true
@@ -900,12 +935,20 @@ enum VideoRenderer {
 
             guard let sample = videoOut.copyNextSampleBuffer() else { break }
             guard let imageBuffer = CMSampleBufferGetImageBuffer(sample),
-                  let cg = Pix.cgImage(from: imageBuffer),
-                  let buf = makeFrame(cg,
+                  let cg = Pix.cgImage(from: imageBuffer) else { continue }
+            guard let buf = makeFrame(cg,
                                       settings: settings,
                                       model: settings.useAI ? model : nil,
                                       control: control,
-                                      onNotice: onNotice) else { continue }
+                                      onNotice: onNotice) else {
+                // 静默丢帧会让下一对帧拿"两帧之前"的画面做光流，插到错位置；连续失败就直接中止。
+                droppedFrames += 1
+                if droppedFrames >= 8 {
+                    throw VideoRenderError.writeFailed("连续 \(droppedFrames) 帧缩放/推理失败，已中止（可能是内存不足）")
+                }
+                continue
+            }
+            droppedFrames = 0
 
             if let prev = prevBuf, prev.count == buf.count {
                 let needsInterp = perPair > 1 || blurOn
@@ -979,16 +1022,28 @@ enum VideoRenderer {
             try writeFrame(last)
         }
 
+        // 视频读完了但音轨往往还多几十毫秒：再抽干一次，否则成片末尾掉音。
+        if !cancelled, !audioFinished, audioIn != nil {
+            for _ in 0..<400 {
+                if audioFinished { break }
+                if let audioIn, audioIn.isReadyForMoreMediaData {
+                    pumpAudio()
+                } else {
+                    Thread.sleep(forTimeInterval: 0.002)
+                }
+            }
+        }
+
         if cancelled {
-            reader.cancelReading()
-            writer.cancelWriting()
-            try? FileManager.default.removeItem(at: dest)
             throw VideoRenderError.cancelledInternally
         }
 
         if reader.status == .failed {
-            writer.cancelWriting()
             throw VideoRenderError.writeFailed(reader.error?.localizedDescription ?? "解码中断")
+        }
+
+        if audioDropped > 0 {
+            onNotice("音轨有 \(audioDropped) 个包未能写入（可能影响音画同步）")
         }
 
         videoIn.markAsFinished()
@@ -1002,6 +1057,7 @@ enum VideoRenderer {
             throw VideoRenderError.writeFailed(writer.error?.localizedDescription ?? "封装失败")
         }
 
+        finishedCleanly = true
         onFrame(max(baseFrames + outIndex, 1), max(outIndex, 1))
         return Report(frames: outIndex, outputURL: dest)
     }
@@ -1043,7 +1099,10 @@ enum VideoRenderer {
             if doneSegments.contains(seg), exists { continue }
 
             let start = CMTime(seconds: Double(seg) * segmentSeconds, preferredTimescale: 600)
-            let duration = CMTime(seconds: segmentSeconds, preferredTimescale: 600)
+            // 末片往往不足 20 秒：按剩余时长截断，别让 reader 读到素材结尾之外。
+            let remain = max(0.1, settings.duration - Double(seg) * segmentSeconds)
+            let segSeconds = min(segmentSeconds, remain)
+            let duration = CMTime(seconds: segSeconds, preferredTimescale: 600)
             _ = try render(source: source,
                            dest: url,
                            settings: settings,
@@ -1078,10 +1137,15 @@ enum VideoRenderer {
         var cursor = CMTime.zero
         var appended = 0
 
-        for url in urls {
-            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+        for (idx, url) in urls.enumerated() {
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw VideoRenderError.writeFailed("第 \(idx + 1) 片文件不存在，无法拼接")
+            }
             let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-            guard let v = asset.tracks(withMediaType: .video).first else { continue }
+            guard let v = asset.tracks(withMediaType: .video).first,
+                  v.timeRange.duration.seconds > 0.001 else {
+                throw VideoRenderError.writeFailed("第 \(idx + 1) 片没有可用画面（可能上次中断），请丢弃续传后重跑")
+            }
             let range = CMTimeRange(start: .zero, duration: v.timeRange.duration)
             do {
                 try vTrack.insertTimeRange(range, of: v, at: cursor)
@@ -1104,7 +1168,7 @@ enum VideoRenderer {
         export.outputURL = dest
         export.outputFileType = .mp4
         export.shouldOptimizeForNetworkUse = false
-        export.timeRange = CMTimeRange(start: .zero, duration: cursor)
+        export.timeRange = CMTimeRange(start: .zero, duration: comp.duration)
         let sem = DispatchSemaphore(value: 0)
         export.exportAsynchronously { sem.signal() }
         sem.wait()
@@ -1244,11 +1308,25 @@ final class VideoEngine: ObservableObject {
 
         let copyName = "video-\(Int(Date().timeIntervalSince1970))-\(url.lastPathComponent)"
         let dest = FileManager.default.temporaryDirectory.appendingPathComponent(copyName)
-        try? FileManager.default.removeItem(at: dest)
-        do {
-            try FileManager.default.copyItem(at: url, to: dest)
-        } catch {
-            notice = "读取视频失败：\(error.localizedDescription)"
+        // 4K60 一分钟约 400MB：本函数跑在主线程，同步 copy 会撞看门狗被杀（0x8badf00d）。
+        // 挪到后台队列，并优先 move（源本来就是选择器给的临时副本），省掉一次全量写盘。
+        let copyError: Error? = await withCheckedContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    try? FileManager.default.removeItem(at: dest)
+                    do {
+                        try FileManager.default.moveItem(at: url, to: dest)
+                    } catch {
+                        try FileManager.default.copyItem(at: url, to: dest)
+                    }
+                    cont.resume(returning: nil)
+                } catch {
+                    cont.resume(returning: error)
+                }
+            }
+        }
+        if let copyError {
+            notice = "读取视频失败：\(copyError.localizedDescription)"
             return
         }
 
@@ -1350,14 +1428,14 @@ final class VideoEngine: ObservableObject {
             notes.append("HLG/BT.2020 10-bit 输出，上限 4K / 830 万像素；设备编码兼容性以真机验证为准")
         }
 
-        if hdrEnabled {
-            let evenW = tw - tw % 2
-            let evenH = th - th % 2
-            if evenW != tw || evenH != th {
-                tw = max(2, evenW)
-                th = max(2, evenH)
-                notes.append("为 P010 色度采样将尺寸调整为偶数：\(tw)×\(th)")
-            }
+        // 唯一的尺寸出口：writer settings、adaptor 属性、writeP010、Pix.draw、makeFrame 全吃这两个值。
+        // 奇数宽高在 P010 下非法；0/1 会让 AVAssetWriterInput 抛 NSInvalidArgumentException。
+        let evenW = max(2, tw - tw % 2)
+        let evenH = max(2, th - th % 2)
+        if evenW != tw || evenH != th {
+            tw = evenW
+            th = evenH
+            notes.append("尺寸取偶以适配 4:2:0 色度采样：\(tw)×\(th)")
         }
 
         // AI 输入尽量贴近原片分辨率：4× 重建后再缩到目标尺寸等于超采样，比「先缩小再重建」锐利得多。

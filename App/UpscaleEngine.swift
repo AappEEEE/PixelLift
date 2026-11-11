@@ -197,6 +197,16 @@ enum TileEngine {
         let usable = ot - crop * 2     // 有效 768
         let oCount = 3 * plane
 
+        // 下面是裸指针读：模型输出形状/类型不符就是越界读（EXC_BAD_ACCESS）或 NSRangeException。
+        // 契约必须严格是 [1,3,ot,ot] 的 float32/float16/double，别的直接抛错退化成插值。
+        let shape = o.shape.map { $0.intValue }
+        guard shape.count == 4, shape[0] == 1, shape[1] == 3,
+              shape[2] == ot, shape[3] == ot, o.count >= oCount else {
+            throw NSError(domain: "PixelLift", code: 2,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "模型输出尺寸 \(shape) 与契约 [1,3,\(ot),\(ot)] 不符（count \(o.count)）"])
+        }
+
         let raw = o.dataPointer
         let read: (Int) -> Float
         switch o.dataType {
@@ -210,7 +220,10 @@ enum TileEngine {
             let q = raw.bindMemory(to: Double.self, capacity: oCount)
             read = { Float(q[$0]) }
         default:
-            read = { o[$0].floatValue }
+            // 量化模型（int32/int8）走下标访问会在超界时抛 NSRangeException，宁可退化成插值。
+            throw NSError(domain: "PixelLift", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "模型输出数据类型 \(o.dataType.rawValue) 未支持，请用 float32/float16 转换"])
         }
 
         // 定位：块左上角 ox,oy 对应目标像素 (ox*4, oy*4)，去掉单侧 crop 后无缝拼回去
