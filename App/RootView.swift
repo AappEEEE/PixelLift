@@ -1,6 +1,6 @@
 import SwiftUI
-import UIKit
 
+/// 两个主标签页。
 enum AppTab: Int, CaseIterable, Hashable {
     case image
     case video
@@ -18,150 +18,34 @@ enum AppTab: Int, CaseIterable, Hashable {
         case .video: return "film.stack"
         }
     }
-
-    var iconFilled: String {
-        switch self {
-        case .image: return "photo.stack.fill"
-        case .video: return "film.stack.fill"
-        }
-    }
 }
 
-/// 底部浮动胶囊导航：材质底 + 边缘高光 + 选中块随切换滑动。
-/// iOS 26 起系统 TabBar 会自带 Liquid Glass；这里用手写材质条保证 iOS 17+ 观感一致，
-/// 且不依赖 iOS 18/26 才有的 API，避免 SDK 差异导致编译失败。
-@MainActor
-struct GlassTabBar: View {
-    @Binding var selection: AppTab
-    @Namespace private var namespace
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
-    var body: some View {
-        HStack(spacing: 2) {
-            ForEach(AppTab.allCases, id: \.self) { tab in
-                button(for: tab)
-            }
-        }
-        .padding(5)
-        .background(background)
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [.white.opacity(0.55), .white.opacity(0.08), .white.opacity(0.22)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 0.7
-                )
-        )
-        .overlay(
-            Capsule(style: .continuous)
-                .strokeBorder(.black.opacity(0.12), lineWidth: 0.5)
-                .blendMode(.overlay)
-        )
-        .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
-        .padding(.horizontal, 58)
-        .padding(.bottom, 2)
-        .animation(.spring(response: 0.34, dampingFraction: 0.82), value: selection)
-    }
-
-    private func button(for tab: AppTab) -> some View {
-        let isSelected = selection == tab
-        return Button {
-            if selection != tab {
-                selection = tab
-                Haptics.tap()
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Image(systemName: isSelected ? tab.iconFilled : tab.icon)
-                    .font(.system(size: 16, weight: .semibold))
-                    .symbolRenderingMode(.hierarchical)
-                Text(tab.title)
-                    .font(.system(size: 14, weight: .semibold))
-                    .lineLimit(1)
-            }
-            .foregroundStyle(isSelected ? Color.primary : Color.secondary)
-            .padding(.horizontal, isSelected ? 18 : 14)
-            .padding(.vertical, 10)
-            .frame(maxWidth: .infinity)
-            .background {
-                if isSelected {
-                    Capsule(style: .continuous)
-                        .fill(selectedFill)
-                        .overlay(
-                            Capsule(style: .continuous)
-                                .strokeBorder(.white.opacity(0.34), lineWidth: 0.6)
-                        )
-                        .shadow(color: .black.opacity(0.16), radius: 5, y: 2)
-                        .matchedGeometryEffect(id: "selection", in: namespace)
-                }
-            }
-            .contentShape(Capsule(style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(tab.title)
-        .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : [.isButton])
-    }
-
-    private var selectedFill: some ShapeStyle {
-        LinearGradient(
-            colors: [Color.accentColor.opacity(0.30), Color.accentColor.opacity(0.16)],
-            startPoint: .top,
-            endPoint: .bottom
-        )
-    }
-
-    @ViewBuilder
-    private var background: some View {
-        let shape = Capsule(style: .continuous)
-        if reduceTransparency {
-            shape.fill(.regularMaterial)
-        } else {
-            shape
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    shape.fill(
-                        LinearGradient(
-                            colors: [.white.opacity(0.18), .clear, .white.opacity(0.06)],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                )
-        }
-    }
-}
-
-@MainActor
-enum Haptics {
-    static func tap() {
-        let generator = UIImpactFeedbackGenerator(style: .soft)
-        generator.prepare()
-        generator.impactOccurred(intensity: 0.7)
-    }
-}
-
+/// 根视图：直接使用系统 `TabView` + `.tabItem`。
+///
+/// 之前这里是手写的浮动胶囊条（`.ultraThinMaterial` + 渐变描边 + matchedGeometryEffect），
+/// 那只是"看起来像玻璃"，不是 Apple 的 Liquid Glass：材质、模糊半径、边缘高光、
+/// 与滚动内容的联动都由系统控制，手绘无法对齐，反而不符合 HIG。
+///
+/// iOS 26 起系统 TabBar 会自动采用 Liquid Glass（含滚动边缘效果、按压的高光形变、
+/// 标签合并/最小化），所以正确做法是让系统自己画——这也是 Project m3u8 里同一套写法。
+/// 部署目标仍是 iOS 17：低于 26 的系统上就是标准 TabBar，行为一致且不需要任何
+/// 仅在 Xcode 26 SDK 里存在的 API（`glassEffect` / `GlassEffectContainer` 在
+/// 我们 CI 的 Xcode 16 上直接编译不过）。
 @MainActor
 struct RootView: View {
     @State private var tab: AppTab = .image
 
     var body: some View {
-        Group {
-            switch tab {
-            case .image:
-                ContentView()
-            case .video:
-                VideoView()
-            }
+        TabView(selection: $tab) {
+            ContentView()
+                .tabItem { Label(AppTab.image.title, systemImage: AppTab.image.icon) }
+                .tag(AppTab.image)
+
+            VideoView()
+                .tabItem { Label(AppTab.video.title, systemImage: AppTab.video.icon) }
+                .tag(AppTab.video)
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            GlassTabBar(selection: $tab)
-                .padding(.top, 6)
-                .padding(.bottom, 4)
-        }
-        .background(Color(.systemBackground))
+        .tint(.accentColor)
     }
 }
 
