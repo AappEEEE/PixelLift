@@ -50,8 +50,29 @@ jobs:
       - name: Generate project
         run: xcodegen generate
 
+      - name: Select Xcode 26 (iOS 26 SDK → Liquid Glass)
+        run: |
+          # 镜像默认是 Xcode 16.4（iOS 18 SDK），用旧 SDK 链接出来的 App 在 iOS 26 上
+          # 会走"兼容外观"，系统 TabBar 不会应用 Liquid Glass。这里切到 Xcode 26，
+          # 让系统控件按新设计渲染；部署目标仍是 iOS 17，旧系统回落经典外观。
+          for candidate in \
+            /Applications/Xcode_26.3.app \
+            /Applications/Xcode_26.2.app \
+            /Applications/Xcode_26.1.app \
+            /Applications/Xcode_26.1.1.app \
+            /Applications/Xcode_26.0.app \
+            /Applications/Xcode_26.0.1.app ; do
+            if [ -d "$candidate" ]; then
+              sudo xcode-select -s "$candidate"
+              echo "selected $candidate"
+              break
+            fi
+          done
+
       - name: Toolchain info
-        run: xcodebuild -version
+        run: |
+          xcodebuild -version
+          xcode-select -p
 
       - name: Archive (unsigned)
         run: |
@@ -122,7 +143,9 @@ jobs:
               最后 `AVMutableComposition` + passthrough 拼接（不重编码）。HDR 为保证 10-bit 元数据完整，仍走单条输出。
             - **超采样 AI 输入**：AI 不再先把原帧缩到「目标 ÷ 4」，而是在贴近原片的分辨率上 4× 重建再缩下来。
             - **剩余时间**：进度条旁显示预计剩余（暂停时长不计入）。
-            - **底部导航**：自绘浮动胶囊条（材质 + 边缘高光 + 选中块滑动 + 轻触感）。
+            - **底部导航改用系统 TabView**：不再自绘材质胶囊条（那只是"看起来像玻璃"，材质/模糊/高光/与滚动内容联动都不由系统控制），
+              改成标准 `TabView` + `.tabItem`。CI 现在用 **Xcode 26 / iOS 26 SDK** 编译，
+              所以在 iOS 26 上标签栏由系统按 Liquid Glass 渲染（含滚动边缘效果与按压形变）；iOS 17–18 回落到经典标签栏。
 
             ### SDR→HDR（M4）
             - 逐像素：Rec.709 SDR → 线性光 → 可调高光肩部 → Rec.2020 → BT.2100 HLG → P010 10-bit HEVC
