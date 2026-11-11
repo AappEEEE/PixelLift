@@ -155,6 +155,7 @@ enum TileEngine {
             guard let sb = s.baseAddress, w > 0, h > 0 else { return }
             dst.withUnsafeMutableBufferPointer { d in
                 guard let db = d.baseAddress else { return }
+                let dstCount = d.count
                 for y in 0..<step {
                     let sy = min(h - 1, oy + y)
                     let baseRow = (sy * w) * 4
@@ -167,7 +168,7 @@ enum TileEngine {
                             if py >= dstH { break }
                             var di = (py * dstW + (ox * scale + x * scale)) * 4
                             for _ in 0..<scale {
-                                if di + 3 >= db.count { break }
+                                if di + 3 >= dstCount { break }
                                 db[di] = r
                                 db[di + 1] = g
                                 db[di + 2] = b
@@ -544,8 +545,8 @@ final class UpscaleEngine: ObservableObject {
 
         // 整条重活（缩放、推理、拼图、保边锐化、缩到目标、编码）全在后台，
         // 主线程只负责把结果写回 items。以前这些都在主线程，24MP 一单会冻 UI 两秒以上。
-        let result: (url: URL?, thumb: CGImage, label: String)? = await Task.detached(priority: .userInitiated) {
-            () -> (URL?, CGImage, String)? in
+        let result: (url: URL?, thumb: UIImage?, label: String)? = await Task.detached(priority: .userInitiated) {
+            () -> (URL?, UIImage?, String)? in
             var aiInput = cg
             if max(cg.width, cg.height) > p.aiLongEdge {
                 aiInput = Self.resized(cg, longEdge: p.aiLongEdge) ?? cg

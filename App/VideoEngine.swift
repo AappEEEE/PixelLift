@@ -999,8 +999,8 @@ enum VideoRenderer {
                 let aBuf = prevStable ?? prev
 
                 // 一对帧共用同一份分块采样计划（缓存跨 perPair 复用）。
-                pairBlocks = blurOn
-                    ? MotionBlurCore.blockPlan(flow: flow, flowScale: flowScale,
+                pairBlocks = blurOn && flow != nil
+                    ? MotionBlurCore.blockPlan(flow: flow!, flowScale: flowScale,
                                                width: tw, height: th, plan: blurPlan)
                     : nil
 
