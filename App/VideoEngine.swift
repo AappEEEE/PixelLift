@@ -699,19 +699,17 @@ enum VideoRenderer {
         ]
         let pixelFormat = settings.hdrEnabled ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_32BGRA
         if settings.hdrEnabled {
+            // 只标 primaries / transfer / matrix 三项。AVVideoAllowWideColorKey 不放：它要求 NSNumber，
+            // 且 10-bit HLG 的广色域由 P010 像素格式 + 这三项元数据决定，加上反而可能在
+            // AVAssetWriterInput 初始化时抛 NSInvalidArgumentException（真机已复现）。
             videoSettings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
-            ]
-            videoSettings[AVVideoAllowWideColorKey] = true
-        } else {
-            videoSettings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020 as String,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG as String,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020 as String
             ]
         }
+        // SDR 分支不写 AVVideoColorPropertiesKey：BGRA 里带 YCbCrMatrix 是非法组合，
+        // 交给编码器按 32BGRA 默认（Rec.709 / sRGB）处理更安全。
         let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoIn.expectsMediaDataInRealTime = false
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
@@ -791,16 +789,20 @@ enum VideoRenderer {
                 if !control.waitIfPaused() { throw VideoRenderError.cancelledInternally }
                 Thread.sleep(forTimeInterval: 0.004)
             }
-            guard let pool = adaptor.pixelBufferPool else { throw VideoRenderError.pixelBuffer }
+            guard let pool = adaptor.pixelBufferPool else {
+                throw VideoRenderError.writeFailed(settings.hdrEnabled
+                    ? "这台设备没有提供 P010(10-bit) 像素池，HDR 输出不可用，请关掉 SDR→HDR 再试"
+                    : "写入器没有分配像素池，可能内存不足")
+            }
             var maybeBuffer: CVPixelBuffer?
             let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &maybeBuffer)
             guard status == kCVReturnSuccess, let pixelBuffer = maybeBuffer else {
-                throw VideoRenderError.pixelBuffer
+                throw VideoRenderError.writeFailed("取不到可写的像素帧（状态码 \(status)），可能是内存不足")
             }
             if settings.hdrEnabled {
                 guard SDRToHDR.writeP010(buf, width: tw, height: th,
                                          strength: settings.hdrIntensity, into: pixelBuffer) else {
-                    throw VideoRenderError.pixelBuffer
+                    throw VideoRenderError.writeFailed("10-bit P010 帧写入失败：像素格式或尺寸与该设备不兼容")
                 }
             } else {
                 guard let image = Pix.cgImage(rgba: buf, width: tw, height: th),
