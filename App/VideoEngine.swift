@@ -888,6 +888,9 @@ enum VideoRenderer {
         // M6 动态模糊：在曝光窗 [t, t+W] 内做加权时间积分，而不是把几帧糊在一起。
         // W = (快门角/360)/perPair，窗口锚定帧起点 => t+W <= 1 恒成立：
         // 不需要第三帧、不需要第二条光流、所有输出帧积分区间等长（无清晰/模糊闪烁）。
+        // 分块采样计划在一对帧内是常量，算一次就够（否则 perPair=4 时会重算 4 遍）。
+        var pairBlocks: MotionBlurCore.BlockPlan?
+
         func emit(_ a: [UInt8], _ b: [UInt8], t: Float,
                   flow: FlowField?, flowScale: Float) throws {
             if !blurOn {
@@ -900,7 +903,8 @@ enum VideoRenderer {
                                    flow: flow, flowScale: flowScale,
                                    plan: blurPlan,
                                    scratchLinear: &blurLight,
-                                   out: &accum)
+                                   out: &accum,
+                                   cachedBlocks: pairBlocks)
             try writeFrame(accum)
         }
 
@@ -993,6 +997,12 @@ enum VideoRenderer {
                     stableIsA.toggle()
                 }
                 let aBuf = prevStable ?? prev
+
+                // 一对帧共用同一份分块采样计划（缓存跨 perPair 复用）。
+                pairBlocks = blurOn
+                    ? MotionBlurCore.blockPlan(flow: flow, flowScale: flowScale,
+                                               width: tw, height: th, plan: blurPlan)
+                    : nil
 
                 for j in 0..<perPair {
                     let t = Float(j) / Float(perPair)
@@ -1090,28 +1100,35 @@ enum VideoRenderer {
                                 onNotice: @escaping @Sendable (String) -> Void) throws -> Report {
         try? FileManager.default.createDirectory(at: sessionDir, withIntermediateDirectories: true)
         var urls: [URL] = []
-        let fpsPerSegment = framesPerSegment(outFps: settings.outFps)
+        var renderedFrames = 0
 
         for seg in 0..<totalSegments {
             let url = sessionDir.appendingPathComponent(String(format: "seg-%04d.mp4", Int32(seg)))
             urls.append(url)
             let exists = FileManager.default.fileExists(atPath: url.path)
-            if doneSegments.contains(seg), exists { continue }
+            if doneSegments.contains(seg), exists {
+                // 续传跳过的片没跑 render，帧数按名义值累加，进度才不会被"吞"掉。
+                renderedFrames += framesPerSegment(outFps: settings.outFps)
+                continue
+            }
 
             let start = CMTime(seconds: Double(seg) * segmentSeconds, preferredTimescale: 600)
             // 末片往往不足 20 秒：按剩余时长截断，别让 reader 读到素材结尾之外。
             let remain = max(0.1, settings.duration - Double(seg) * segmentSeconds)
             let segSeconds = min(segmentSeconds, remain)
             let duration = CMTime(seconds: segSeconds, preferredTimescale: 600)
-            _ = try render(source: source,
-                           dest: url,
-                           settings: settings,
-                           box: box,
-                           control: control,
-                           timeRange: CMTimeRange(start: start, duration: duration),
-                           baseFrames: seg * fpsPerSegment,
-                           onFrame: onFrame,
-                           onNotice: onNotice)
+            let report = try render(source: source,
+                                    dest: url,
+                                    settings: settings,
+                                    box: box,
+                                    control: control,
+                                    timeRange: CMTimeRange(start: start, duration: duration),
+                                    baseFrames: renderedFrames,
+                                    onFrame: onFrame,
+                                    onNotice: onNotice)
+            // 用实际产出帧数推进起点：各片受 timeRange 边界影响未必恰是名义帧数，
+            // 按名义值累加会让进度条来回跳。
+            renderedFrames += max(1, report.frames)
             onSegment(seg, totalSegments)
         }
 

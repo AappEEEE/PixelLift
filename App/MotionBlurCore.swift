@@ -370,7 +370,8 @@ enum MotionBlurCore {
                         flowScale: Float,
                         plan: Plan,
                         scratchLinear: inout [Float],
-                        out: inout [UInt8]) {
+                        out: inout [UInt8],
+                        cachedBlocks: BlockPlan? = nil) {
         if width < 2 || height < 2 { return }
         let pixelCount: Int = width * height
         let total: Int = pixelCount * 4
@@ -401,11 +402,13 @@ enum MotionBlurCore {
             return
         }
 
-        let bp: BlockPlan = blockPlan(flow: field,
-                                      flowScale: flowScale,
-                                      width: width,
-                                      height: height,
-                                      plan: plan)
+        // 分块采样计划只依赖 (flow, plan, width, height)，一对帧内是常量：
+        // 逐输出帧重算会白跑 perPair−1 次（perPair=4 时是 3 次），所以允许调用方缓存。
+        let bp: BlockPlan = cachedBlocks ?? blockPlan(flow: field,
+                                                      flowScale: flowScale,
+                                                      width: width,
+                                                      height: height,
+                                                      plan: plan)
 
         // 全帧都只需要 1 个样本：直接走单次合成，省掉整趟分块循环。
         if bp.maxUsed <= 1 {

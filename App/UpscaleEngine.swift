@@ -116,9 +116,9 @@ enum TileEngine {
         let rows = max(1, Int((Double(h) / Double(step)).rounded(.up)))
         let total = cols * rows
         var done = 0
-        var failed = false
+        var failedTiles = 0
 
-        outer: for row in 0..<rows {
+        for row in 0..<rows {
             for col in 0..<cols {
                 guard control.waitIfPaused() else { return nil }
                 if control.cancelled { return nil }
@@ -127,9 +127,14 @@ enum TileEngine {
                                   ox: col * step, oy: row * step,
                                   dst: &out, dstW: outW, dstH: outH)
                 } catch {
-                    onFallback("AI 推理失败：\(error.localizedDescription)，已退化为插值")
-                    failed = true
-                    break outer
+                    // 只降级这一块：整图重来会把已经算好的块全扔掉，还要再吃一份 16× 缓冲。
+                    failedTiles += 1
+                    if failedTiles == 1 {
+                        onFallback("AI 推理失败：\(error.localizedDescription)，失败块改用插值")
+                    }
+                    blitTileBilinear(src: rgbx, w: w, h: h,
+                                     ox: col * step, oy: row * step,
+                                     dst: &out, dstW: outW, dstH: outH)
                 }
                 done += 1
                 onProgress(done, total)
@@ -137,13 +142,43 @@ enum TileEngine {
         }
 
         if control.cancelled { return nil }
-
-        if failed {
-            var fallback = [UInt8](repeating: 0, count: outW * outH * 4)
-            blitBilinear(src: rgbx, w: w, h: h, dst: &fallback, dw: outW, dh: outH)
-            return fallback
-        }
         return out
+    }
+
+    /// 只把某一块（step×step 源像素）用最近邻撑到 4×，写进 out 的对应位置。
+    /// 用于单块 AI 失败时的降级，避免整图重画。
+    static func blitTileBilinear(src: [UInt8], w: Int, h: Int,
+                                 ox: Int, oy: Int,
+                                 dst: inout [UInt8], dstW: Int, dstH: Int) {
+        let scale = 4
+        src.withUnsafeBufferPointer { s in
+            guard let sb = s.baseAddress, w > 0, h > 0 else { return }
+            dst.withUnsafeMutableBufferPointer { d in
+                guard let db = d.baseAddress else { return }
+                for y in 0..<step {
+                    let sy = min(h - 1, oy + y)
+                    let baseRow = (sy * w) * 4
+                    for x in 0..<step {
+                        let sx = min(w - 1, ox + x)
+                        let si = baseRow + sx * 4
+                        let r = sb[si], g = sb[si + 1], b = sb[si + 2]
+                        for dy in 0..<scale {
+                            let py = oy * scale + y * scale + dy
+                            if py >= dstH { break }
+                            var di = (py * dstW + (ox * scale + x * scale)) * 4
+                            for _ in 0..<scale {
+                                if di + 3 >= db.count { break }
+                                db[di] = r
+                                db[di + 1] = g
+                                db[di + 2] = b
+                                db[di + 3] = 255
+                                di += 4
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     @inline(__always)
@@ -501,19 +536,24 @@ final class UpscaleEngine: ObservableObject {
         let cg = item.source
         let id = item.id
 
-        var aiInput = cg
-        if max(cg.width, cg.height) > p.aiLongEdge {
-            aiInput = Self.resized(cg, longEdge: p.aiLongEdge) ?? cg
-        }
-        let w = aiInput.width, h = aiInput.height
-        guard let rgbx = Self.rgbx(aiInput, width: w, height: h) else {
-            items[idx].message = "像素读取失败"
-            return false
-        }
-
         let model = models[kind] ?? models[.photo]
-        let buf: [UInt8]? = await Task.detached(priority: .userInitiated) { () -> [UInt8]? in
-            TileEngine.upscale(
+        let targetW = p.targetWidth
+        let targetH = p.targetHeight
+        let detailAmount = detail
+        let denoiseAmount = denoise
+
+        // 整条重活（缩放、推理、拼图、保边锐化、缩到目标、编码）全在后台，
+        // 主线程只负责把结果写回 items。以前这些都在主线程，24MP 一单会冻 UI 两秒以上。
+        let result: (url: URL?, thumb: CGImage, label: String)? = await Task.detached(priority: .userInitiated) {
+            () -> (URL?, CGImage, String)? in
+            var aiInput = cg
+            if max(cg.width, cg.height) > p.aiLongEdge {
+                aiInput = Self.resized(cg, longEdge: p.aiLongEdge) ?? cg
+            }
+            let w = aiInput.width, h = aiInput.height
+            guard let rgbx = Self.rgbx(aiInput, width: w, height: h) else { return nil }
+
+            let buf: [UInt8]? = TileEngine.upscale(
                 model: model, rgbx: rgbx, width: w, height: h, control: ctl,
                 onProgress: { done, total in
                     Task { @MainActor [weak self] in
@@ -522,37 +562,37 @@ final class UpscaleEngine: ObservableObject {
                 },
                 onFallback: { message in
                     Task { @MainActor [weak self] in
-                        self?.notice = message
+                        if self?.notice == nil { self?.notice = message }
                     }
                 }
             )
+
+            guard let out = buf else { return nil }
+            let outW = w * 4, outH = h * 4
+            guard let aiCG = Self.makeCGImage(from: out, width: outW, height: outH) else { return nil }
+            let resizedCG = Self.resampled(aiCG, width: targetW, height: targetH) ?? aiCG
+            let finalCG = Self.detailPass(resizedCG, detail: detailAmount, denoise: denoiseAmount) ?? resizedCG
+            let url = Self.write(finalCG, format: format, name: item.name, index: idx + 1)
+            let attrs = url.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path) }
+            let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+            let kb = max(1, bytes / 1024)
+            let thumb = Self.thumbnail(finalCG, maxEdge: 240)
+            let label = "\(finalCG.width) × \(finalCG.height) · \(kb) KB"
+            return (url, thumb, label)
         }.value
 
-        guard let out = buf else {
+        guard let result else {
             if ctl.cancelled { items[idx].message = "已取消" }
             return false
         }
 
-        let outW = w * 4, outH = h * 4
-        guard let aiCG = Self.makeCGImage(from: out, width: outW, height: outH) else {
-            items[idx].message = "拼接输出失败"
-            return false
-        }
-
-        let resizedCG = Self.resampled(aiCG, width: p.targetWidth, height: p.targetHeight) ?? aiCG
-        let finalCG = Self.detailPass(resizedCG, detail: detail, denoise: denoise) ?? resizedCG
-        guard let url = Self.write(finalCG, format: format,
-                                   name: item.name, index: idx + 1) else {
+        items[idx].resultThumb = result.thumb
+        items[idx].outputLabel = result.label
+        guard let url = result.url else {
             items[idx].message = "写文件失败"
             return false
         }
-
         items[idx].outputURL = url
-        items[idx].resultThumb = Self.thumbnail(finalCG, maxEdge: 240)
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? 0
-        let kb = max(1, bytes / 1024)
-        items[idx].outputLabel = "\(finalCG.width) × \(finalCG.height) · \(kb) KB"
         items[idx].progress = 1
         return true
     }
