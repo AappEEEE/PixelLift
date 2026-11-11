@@ -652,7 +652,7 @@ final class UpscaleEngine: ObservableObject {
         return out ?? image.cgImage
     }
 
-    nonisolated private static func rgbx(_ cg: CGImage, width: Int, height: Int) -> [UInt8]? {
+    nonisolated static func rgbx(_ cg: CGImage, width: Int, height: Int) -> [UInt8]? {
         var buffer = [UInt8](repeating: 0, count: width * height * 4)
         let ok = buffer.withUnsafeMutableBytes { raw -> Bool in
             guard let base = raw.baseAddress else { return false }
@@ -668,7 +668,7 @@ final class UpscaleEngine: ObservableObject {
         return ok ? buffer : nil
     }
 
-    nonisolated private static func makeCGImage(from buffer: [UInt8], width: Int, height: Int) -> CGImage? {
+    nonisolated static func makeCGImage(from buffer: [UInt8], width: Int, height: Int) -> CGImage? {
         var copy = buffer
         return copy.withUnsafeMutableBytes { raw -> CGImage? in
             guard let base = raw.baseAddress else { return nil }
@@ -681,7 +681,7 @@ final class UpscaleEngine: ObservableObject {
         }
     }
 
-    nonisolated private static func thumbnail(_ cg: CGImage, maxEdge: Int) -> UIImage? {
+    nonisolated static func thumbnail(_ cg: CGImage, maxEdge: Int) -> UIImage? {
         let k = Double(maxEdge) / Double(max(cg.width, cg.height))
         if k >= 1 {
             return UIImage(cgImage: cg)
@@ -691,7 +691,7 @@ final class UpscaleEngine: ObservableObject {
         return resampled(cg, width: w, height: h).map { UIImage(cgImage: $0) }
     }
 
-    nonisolated private static func resized(_ cg: CGImage, longEdge: Int) -> CGImage? {
+    nonisolated static func resized(_ cg: CGImage, longEdge: Int) -> CGImage? {
         let w = cg.width, h = cg.height
         let k = Double(longEdge) / Double(max(w, h))
         let nw = max(1, Int(Double(w) * k)), nh = max(1, Int(Double(h) * k))
@@ -735,7 +735,7 @@ final class UpscaleEngine: ObservableObject {
         return ctx.makeImage()
     }
 
-    nonisolated private static func write(_ cg: CGImage, format: ExportFormat, name: String, index: Int) -> URL? {
+    nonisolated static func write(_ cg: CGImage, format: ExportFormat, name: String, index: Int) -> URL? {
         let safe = name.replacingOccurrences(of: "/", with: "_")
             .replacingOccurrences(of: ":", with: "_")
         let file = "PixelLift-\(index)-\(Int(Date().timeIntervalSince1970))-\(safe).\(format.ext)"
@@ -765,7 +765,7 @@ struct PhotoJob: Sendable {
     let targetH: Int
     let detail: Double
     let denoise: Double
-    let format: UpscaleEngine.ExportFormat
+    let format: ExportFormat
     let name: String
     let index: Int
     let model: MLModel?
