@@ -682,36 +682,73 @@ enum VideoRenderer {
         // 之前的写法漏乘帧率，4K 只给 6Mbps，画面会被压得很糊。
         let bitsPerPixel = settings.hdrEnabled ? 0.12 : 0.08
         let bitrate = max(8_000_000, Int(Double(tw) * Double(th) * max(1.0, settings.outFps) * bitsPerPixel))
-        var compression: [String: Any] = [
-            AVVideoAverageBitRateKey: bitrate,
-            AVVideoMaxKeyFrameIntervalKey: 60,
-            AVVideoExpectedSourceFrameRateKey: max(1, Int(settings.outFps.rounded()))
-        ]
-        if settings.hdrEnabled {
-            // P010 输入本身会驱动 Main10；显式写上让编码器别退回 8-bit profile。
-            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
-        }
-        var videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: tw,
-            AVVideoHeightKey: th,
-            AVVideoCompressionPropertiesKey: compression
-        ]
-        let pixelFormat = settings.hdrEnabled ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange : kCVPixelFormatType_32BGRA
-        if settings.hdrEnabled {
-            // 只标 primaries / transfer / matrix 三项。AVVideoAllowWideColorKey 不放：它要求 NSNumber，
-            // 且 10-bit HLG 的广色域由 P010 像素格式 + 这三项元数据决定，加上反而可能在
-            // AVAssetWriterInput 初始化时抛 NSInvalidArgumentException（真机已复现）。
-            videoSettings[AVVideoColorPropertiesKey] = [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020 as String,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG as String,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020 as String
+
+        // AVAssetWriterInput 在字典不合法时会抛 ObjC 异常（Swift 的 do/catch 接不住，真机直接闪退）。
+        // 所以统一用 PLTryCatch 包住：HDR 配置不被本机接受就退回 SDR，而不是崩掉。
+        func makeVideoInput(hdr: Bool) -> (input: AVAssetWriterInput, format: OSType)? {
+            var compression: [String: Any] = [
+                AVVideoAverageBitRateKey: bitrate,
+                AVVideoMaxKeyFrameIntervalKey: 60,
+                AVVideoExpectedSourceFrameRateKey: max(1, Int(settings.outFps.rounded()))
             ]
+            var videoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoWidthKey: tw,
+                AVVideoHeightKey: th
+            ]
+            if hdr {
+                // P010 输入本身会驱动 Main10；显式写上让编码器别退回 8-bit profile。
+                compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel as String
+                // 只标 primaries / transfer / matrix 三项。AVVideoAllowWideColorKey 不放：
+                // 真机上它会让 AVAssetWriterInput 抛 NSInvalidArgumentException（需要 NSNumber，
+                // 而且 10-bit HLG 的广色域由 P010 + 这三项元数据决定）。
+                videoSettings[AVVideoColorPropertiesKey] = [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020 as String,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG as String,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020 as String
+                ]
+            }
+            // SDR 分支不写 AVVideoColorPropertiesKey：BGRA 里带 YCbCrMatrix 是非法组合。
+            videoSettings[AVVideoCompressionPropertiesKey] = compression
+            let format: OSType = hdr
+                ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                : kCVPixelFormatType_32BGRA
+            var built: (AVAssetWriterInput, OSType)?
+            let ok = PLTryCatch {
+                let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
+                input.expectsMediaDataInRealTime = false
+                built = (input, format)
+            }
+            return ok ? built : nil
         }
-        // SDR 分支不写 AVVideoColorPropertiesKey：BGRA 里带 YCbCrMatrix 是非法组合，
-        // 交给编码器按 32BGRA 默认（Rec.709 / sRGB）处理更安全。
-        let videoIn = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
-        videoIn.expectsMediaDataInRealTime = false
+
+        var hdrActive = false
+        var videoIn: AVAssetWriterInput
+        var pixelFormat: OSType
+        if settings.hdrEnabled, let built = makeVideoInput(hdr: true) {
+            videoIn = built.input
+            pixelFormat = built.format
+            hdrActive = true
+        } else if let built = makeVideoInput(hdr: false) {
+            videoIn = built.input
+            pixelFormat = built.format
+            if settings.hdrEnabled {
+                onNotice("这台设备不接受 HLG 10-bit 输出配置，已自动回退到 SDR（Rec.709）")
+            }
+        } else {
+            throw VideoRenderError.writerSetup
+        }
+
+        // canAdd 返回 false 说明编码器不接受这套配置（例如机型不支持 10-bit），同样退回 SDR。
+        if !writer.canAdd(videoIn), hdrActive, let built = makeVideoInput(hdr: false) {
+            videoIn = built.input
+            pixelFormat = built.format
+            hdrActive = false
+            onNotice("这台设备的 HEVC 编码器不接受 10-bit HDR 配置，已回退到 SDR")
+        }
+        guard writer.canAdd(videoIn) else { throw VideoRenderError.writerSetup }
+        writer.add(videoIn)
+
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoIn,
             sourcePixelBufferAttributes: [
@@ -721,8 +758,6 @@ enum VideoRenderer {
                 kCVPixelBufferIOSurfacePropertiesKey as String: [:]
             ]
         )
-        guard writer.canAdd(videoIn) else { throw VideoRenderError.writerSetup }
-        writer.add(videoIn)
 
         var audioIn: AVAssetWriterInput?
         if audioOut != nil {
@@ -790,7 +825,7 @@ enum VideoRenderer {
                 Thread.sleep(forTimeInterval: 0.004)
             }
             guard let pool = adaptor.pixelBufferPool else {
-                throw VideoRenderError.writeFailed(settings.hdrEnabled
+                throw VideoRenderError.writeFailed(hdrActive
                     ? "这台设备没有提供 P010(10-bit) 像素池，HDR 输出不可用，请关掉 SDR→HDR 再试"
                     : "写入器没有分配像素池，可能内存不足")
             }
@@ -799,7 +834,7 @@ enum VideoRenderer {
             guard status == kCVReturnSuccess, let pixelBuffer = maybeBuffer else {
                 throw VideoRenderError.writeFailed("取不到可写的像素帧（状态码 \(status)），可能是内存不足")
             }
-            if settings.hdrEnabled {
+            if hdrActive {
                 guard SDRToHDR.writeP010(buf, width: tw, height: th,
                                          strength: settings.hdrIntensity, into: pixelBuffer) else {
                     throw VideoRenderError.writeFailed("10-bit P010 帧写入失败：像素格式或尺寸与该设备不兼容")

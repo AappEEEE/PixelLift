@@ -1,4 +1,4 @@
-# PixelLift 视频 SDR → HDR（HLG）
+﻿# PixelLift 视频 SDR → HDR（HLG）
 
 ## 当前实现
 
@@ -32,3 +32,13 @@ python scripts/verify_hdr_math.py
 5. 长视频热量、输出码率、音轨透传、暂停/取消和保存相册。
 
 任何一项失败，都先调节映射或把 HDR toggle 默认关闭；严禁将仅有元数据的 8-bit SDR 文件描述成 HDR 输出。
+
+
+## 设备兼容性与回退
+
+AVAssetWriterInput 在输出配置非法时会抛 ObjC 异常（Swift 的 do/catch 接不住，表现为直接闪退）。真机上已经踩到过一次：AVVideoAllowWideColorKey 的值必须是 NSNumber，放进去就崩。现在的做法：
+
+1. HDR 只设 AVVideoColorPropertiesKey 的 primaries / transfer / matrix 三项，SDR 完全不设色彩属性（BGRA 里带 YCbCrMatrix 是非法组合）。
+2. 所有 AVAssetWriterInput 的创建都包在 PLTryCatch（ObjC @try/@catch）里，抛异常就回退 SDR 并提示「已自动回退到 SDR」。
+3. 即使创建成功，writer.canAdd 为 false 也会再回退一次；两次都失败才报错。
+4. P010 像素池取不到时给出明确文案，而不是笼统的「帧写入失败」。
